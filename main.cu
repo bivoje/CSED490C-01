@@ -92,7 +92,8 @@ int host_collatz_delay(mpz_t _n, unsigned limit, float *time, int log=0) {
 
 void host_collatz_steps(mpz_t _n, int repeat, int log=0) {
     mpz_t n; mpz_init(n); mpz_set(n, _n);
-    for(int i=0; i<repeat; i++) {
+    gmp_printf("%d C| -> %Zd\n", 0, n);
+    for(int i=1; i<=repeat; i++) {
         _host_collatz_delay(n, 1, log);
         gmp_printf("%d C| -> %Zd\n", i, n);
     }
@@ -189,6 +190,13 @@ __device__ double __sum_block_sync(double v) {
     return vv[0];
 }
 
+__device__ double modf_p(double v, int *p) {
+    double tfrac, tint;
+    tfrac = modf(v, &tint);
+    *p += ((int) tint);
+    return tfrac;
+}
+
 // TODO merge with __sum_block_sync
 // FIXME assumes blockDim being multiple of 2
 __device__ bool __xor_block_sync(bool v) {
@@ -219,23 +227,57 @@ __global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, 
     unsigned n = ns[k];
     int stops = 0;
 
+    __shared__ double ranks[1024];
+    __shared__ int rankp[1024];
+    __shared__ int termp[1024];
+
     while(limit == 0 || stops < limit) {
 
         bool is_one = __all_block_sync(n == 1);
         bool is_even; {
-            double rank = ((double) n) * (((double) M_) / m);
-            double tint, tfrac;
-            tfrac = modf(rank, &tint);
-            rank = (((int) tint) % 2) + tfrac;
-            double rank_total = __sum_block_sync(rank) + 1e-3;
-            bool rank_parity = 1 & (int) floor(rank_total);
-            if(log==2 && threadIdx.x==0) printf("rank=%lf, rank_total=%lf, rank_parity=%d\n", rank, rank_total, rank_parity);
+            //double rank = ((double) n) * (((double) M_) / (double) m);
+            //double rank_total = __sum_block_sync(tfrac) + 1e-3;
+            //bool rank_parity = 1 & (int) floor(rank_total);
+            double rank = ((double) M_) / (double) m;
+            int pp = 0;
+            rank = modf_p(rank, &pp);
+            rank = modf_p(((double) n) * rank, &pp);
 
-            bool term_parity = (((unsigned long) n) * M_) % 2;
-            bool terms_parity = __xor_block_sync(term_parity);
+            ranks[threadIdx.x] = rank;
+            rankp[threadIdx.x] = pp;
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                if (threadIdx.x < stride) {
+                    double r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
+                    int p = rankp[threadIdx.x] + rankp[threadIdx.x + stride];
+                    r = modf_p(r, &p);
+                    ranks[threadIdx.x] = r;
+                    rankp[threadIdx.x] = p;
+                }
+                __syncthreads();
+            }
+            if(threadIdx.x == 0) ranks[0] = modf_p(ranks[0] + 1e-3, &rankp[0]);
+            __syncthreads();
+            double rank_total = ranks[0];
+            int rank_parity = rankp[0];
+
+            if(log==2 && threadIdx.x==0) printf("pp=%d, rank=%lf, rank_total=%lf, rank_parity=%d\n", pp, rank, rank_total, rank_parity);
+
+            int term_parity = (((unsigned long) n) * M_) % 2;
+            //bool terms_parity = __xor_block_sync(term_parity);
+            termp[threadIdx.x] = term_parity;
+            //__syncthreads();
+            //if(threadIdx.x == 0) for(int k=0; k<blockDim.x; k++) printf("%d - %d\n", k, termp[k]);
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                if (threadIdx.x < stride) {
+                    termp[threadIdx.x] += termp[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            bool terms_parity = 1 & termp[0];
+
             if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
 
-            bool parity = rank_parity ^ terms_parity;
+            bool parity = 1 & (rank_parity ^ terms_parity);
             is_even = !parity;
             if(log==2 && threadIdx.x==0) printf("parity=%d\n", parity);
         }
@@ -328,10 +370,10 @@ int device_collatz_delay(unsigned K, unsigned *host_ms, mpz_t n, unsigned limit,
 }
 
 void device_collatz_steps(unsigned K, unsigned *host_ms, mpz_t n, int repeat, int log=0) {
-
+    gmp_printf("%d G| -> %Zd\n", 0, n);
     struct collatz_delay_t A;
     device_collatz_init(&A, K, host_ms, n);
-    for(int i=0; i<repeat; i++) {
+    for(int i=1; i<=repeat; i++) {
         device_collatz_kernel(&A, 1, NULL, log);
         mpz_t t; mpz_init(t);
         host_crt2int(t, K, host_ms, A.host_ns);
@@ -379,7 +421,7 @@ int main(int argc, char **argv) {
 
     int sel = 3;
     if(argc > 3) {
-        sel = argv[3][0] & 3;
+        sel = argv[3][0] & 7;
         assert(sel);
     }
 
@@ -424,10 +466,12 @@ int main(int argc, char **argv) {
     gmp_printf("size_level: %d, sel: %c%c, limit:%u\n", size_level, sel&1?'c':'\0', sel&2?'g':'\0', limit);
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
-    test_compare_str(K, host_ms, n, sel, limit, 2);
-
-    //host_collatz_steps(n, 10);
-    //device_collatz_steps(K, host_ms, n, 10);
+    if(sel <= 3) 
+        test_compare_str(K, host_ms, n, sel, limit, 2);
+    else {
+        host_collatz_steps(n, 10);
+        device_collatz_steps(K, host_ms, n, 10);
+    }
 
     return 0;
 }
