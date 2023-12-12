@@ -5,7 +5,8 @@
 #include <stdio.h>
 #include <gmp.h>
 
-//#include "primes.list"
+// =====================================
+// host CRT
 
 void host_ui2crt(unsigned *ns, unsigned K, unsigned *ms, unsigned n) {
     for(int k=0; k<K; k++) ns[k] = n % ms[k];
@@ -45,6 +46,10 @@ void host_crt2int(mpz_t n, unsigned K, unsigned *_ms, unsigned *_ns) {
 
     mpz_clears(term, M, _M, NULL);
 }
+
+
+// =====================================
+// host collatz
 
 int _host_collatz_delay(mpz_t n, unsigned limit, int log=0) {
     int stops = 0;
@@ -99,25 +104,31 @@ void host_collatz_steps(mpz_t _n, int repeat, int log=0) {
     }
 }
 
-void test_crt_conv() {
-    const unsigned K = 6;
-    unsigned _ms[K] = {10007,10009,10037,10039,10061,10067};
-    unsigned _ns[K] = {0,};
-    unsigned _n = 987654321;
+size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base, int log=0) {
+    mpz_t n; mpz_init(n); mpz_set(n, _n);
+    size_t maxbits = mpz_sizeinbase(n, base);
 
-    mpz_t n;
-    mpz_set_ui(n, _n);
+    int stops = 0;
+    while(limit == 0 || stops < limit && mpz_cmp_ui(n, 1) != 0) {
+        if(mpz_even_p(n)) {
+            mpz_divexact_ui(n, n, 2);
+        } else {
+            mpz_mul_ui(n, n, 3);
+            mpz_add_ui(n, n, 1);
+        }
+        size_t bits = mpz_sizeinbase(n, base);
+        maxbits = maxbits>bits? maxbits: bits;
+    }
 
-    host_int2crt(_ns, K, _ms, n);
-    gmp_printf("ns = "); for(int k=0; k<K; k++) gmp_printf("%d, ", _ns[k]); gmp_printf("\n");
-    host_crt2int(n, K, _ms, _ns);
-    gmp_printf("n = %Zd\n", n);
-
-    mpz_clear(n);
+    return maxbits;
 }
 
+
+// =====================================
+// device collatz
+
 __device__ bool __all_block_sync(bool v) {
-    __shared__ int vv[32]; // = {1,};
+    __shared__ int vv[32];
 
     v = __all_sync(0xFFFFFFFF, v);
 
@@ -127,8 +138,7 @@ __device__ bool __all_block_sync(bool v) {
     __syncthreads();
 
     if(threadIdx.x < 32) {
-        v = __all_sync(0xFFFFFFFF, v);
-        vv[threadIdx.x] = v;
+        vv[threadIdx.x] = __all_sync(0xFFFFFFFF, vv[threadIdx.x]);
     }
 
     __syncthreads();
@@ -159,7 +169,7 @@ __device__ int mod_inv(int m, int x) {
 
         if(r2 == 0) {
             assert(r1 == 1);
-            return ((t1%m)+m) % m; // FIXME further limits the size of m
+            return ((t1%m)+m) % m;
         }
 
         int s2 = s0 - s1 * q1;
@@ -169,44 +179,6 @@ __device__ int mod_inv(int m, int x) {
     }
 }
 
-// TODO merge with __xor_block_sync
-// FIXME assumes blockDim being multiple of 2
-__device__ double __sum_block_sync(double v) {
-    __shared__ double vv[1024]; // = {0,};
-    vv[threadIdx.x] = v;
-
-    // TODO unroll last warp
-    for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            double rank = vv[threadIdx.x] + vv[threadIdx.x + stride];
-            //double tfrac, tint;
-            //tfrac = modf(rank, &tint);
-            //rank = (((int) tint) % 2) + tfrac;
-            vv[threadIdx.x] = rank;
-        }
-        __syncthreads();
-    }
-
-    return vv[0];
-}
-
-// TODO merge with __sum_block_sync
-// FIXME assumes blockDim being multiple of 2
-__device__ bool __xor_block_sync(bool v) {
-    __shared__ bool vv[1024]; // = {0,};
-    vv[threadIdx.x] = v;
-
-    // TODO unroll last warp
-    for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            vv[threadIdx.x] ^= vv[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    return vv[0];
-}
-
 __device__ double modf_p(double v, int *p) {
     double tfrac, tint;
     tfrac = modf(v, &tint);
@@ -214,7 +186,7 @@ __device__ double modf_p(double v, int *p) {
     return tfrac;
 }
 
-__global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
+__global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
     const unsigned k = threadIdx.x;
     const unsigned m = ms[k];
     unsigned _M_; {
@@ -229,33 +201,33 @@ __global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, 
 
     __shared__ unsigned long long ranks[1024];
     __shared__ int rankp[1024];
-    __shared__ int termp[1024];
-
-    if(threadIdx.x == 0) printf("blockdim: %d\n", blockDim.x);
+    __shared__ bool termp[1024];
 
     while(limit == 0 || stops < limit) {
 
         bool is_one = __all_block_sync(n == 1);
         bool is_even; {
-            //double rank = ((double) n) * (((double) M_) / (double) m);
-            //double rank_total = __sum_block_sync(tfrac) + 1e-3;
-            //bool rank_parity = 1 & (int) floor(rank_total);
             double rank = ((double) M_) / (double) m;
             int pp = 0;
             rank = modf_p(rank, &pp);
             rank = modf_p(((double) n) * rank, &pp);
-
             unsigned long long rank_fracs = rank * (1ULL<<63);
+            bool term_parity = (1 & n) * (1 & M_);
 
             ranks[threadIdx.x] = rank_fracs;
             rankp[threadIdx.x] = pp;
+            termp[threadIdx.x] = term_parity;
+
+            __syncthreads();
+
+            // FIXME assumes blockDim being multiple of 2
             for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
-                __syncthreads();
                 if (threadIdx.x < stride) {
                     unsigned long long r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
                     int p = rankp[threadIdx.x] + rankp[threadIdx.x + stride];
                     ranks[threadIdx.x] = r & 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
                     rankp[threadIdx.x] = p + (1 & (r >> 63));
+                    termp[threadIdx.x] ^= termp[threadIdx.x + stride];
                 }
                 __syncthreads();
             }
@@ -265,40 +237,25 @@ __global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, 
                 ranks[0] &= 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
             }
             __syncthreads();
-            //if(threadIdx.x == 0) printf("%016llx\n", ranks[0]);
-            double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
-            int rank_parity = rankp[0];
 
-            if(log==2 && threadIdx.x==0) printf("pp=%d, rank=%lf, rank_total=%lf, rank_parity=%d\n", pp, rank, rank_total, rank_parity);
-            __syncthreads();
-
-            int term_parity = (((unsigned long) n) * M_) % 2;
-            //bool terms_parity = __xor_block_sync(term_parity);
-            termp[threadIdx.x] = term_parity;
-            //__syncthreads();
-            //if(threadIdx.x == 0) for(int k=0; k<blockDim.x; k++) printf("%d - %d\n", k, termp[k]);
-            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
-                if (threadIdx.x < stride) {
-                    termp[threadIdx.x] += termp[threadIdx.x + stride];
-                }
-                __syncthreads();
-            }
-            bool terms_parity = 1 & termp[0];
-
-            if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
-
+            //double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
+            bool rank_parity = 1 & rankp[0];
+            bool terms_parity = termp[0];
             bool parity = 1 & (rank_parity ^ terms_parity);
             is_even = !parity;
-            if(log==2 && threadIdx.x==0) printf("parity=%d\n", parity);
+
+            //if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
+            //if(log==2 && threadIdx.x==0) printf("pp=%d, rank=%lf, rank_total=%lf, rank_parity=%d\n", pp, rank, rank_total, rank_parity);
+            //if(log==2 && threadIdx.x==0) printf("parity=%d\n", parity);
         }
 
         if (is_one) break;
 
         if(is_even) {
-            if(log==1) if(threadIdx.x==0) printf("0 ");
+            //if(log==1) if(threadIdx.x==0) printf("0 ");
             n = div2(m, n); n %= m;
         } else {
-            if(log==1) if(threadIdx.x==0) printf("1 ");
+            //if(log==1) if(threadIdx.x==0) printf("1 ");
             // FIXME assume m < UINTMAX/3
             n *= 3; n += 1; n %= m;
         }
@@ -355,7 +312,7 @@ int device_collatz_kernel(struct collatz_delay_t *A, unsigned limit, float *time
     cudaMalloc((void **)&device_delay, sizeof(int));
 
     cudaEventRecord(A->start, 0);
-    collatz_delay<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit, log);
+    collatz_delay_kernel<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit, log);
     cudaEventRecord(A->stop, 0);
 
     cudaMemcpy(&host_delay, device_delay, sizeof(int), cudaMemcpyDeviceToHost);
@@ -421,6 +378,10 @@ int main(int argc, char **argv) {
     char *num = "10";
     if(argc > 1) {
         num = argv[1];
+        if(num[0] == '0')
+            num = 
+                #include "num"
+            ;
     }
 
     int size_level = 3;
@@ -460,6 +421,7 @@ int main(int argc, char **argv) {
     double max_mantissa = pow(10, fractional);
 
     int num_exponent = strlen(num) - 1;
+    assert(num_exponent >= 0);
     double num_mantissa;
     for(int i=0, v=1; i<min(num_exponent, 5); i++, v*=10)
         num_mantissa += (num[i] - '0') / (double) v;
@@ -477,10 +439,14 @@ int main(int argc, char **argv) {
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
     if(sel <= 3) 
-        test_compare_str(K, host_ms, n, sel, limit, 1);
-    else {
+        test_compare_str(K, host_ms, n, sel, limit, 0);
+    else if(sel == 4) {
         host_collatz_steps(n, 10);
         device_collatz_steps(K, host_ms, n, 10);
+    } else if(sel == 5) {
+        int base = 10;
+        size_t maxbits = host_collatz_maxbits(n, limit, base);
+        printf("maxbits(%d): %lld\n", base, maxbits);
     }
 
     return 0;
