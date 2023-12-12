@@ -190,13 +190,6 @@ __device__ double __sum_block_sync(double v) {
     return vv[0];
 }
 
-__device__ double modf_p(double v, int *p) {
-    double tfrac, tint;
-    tfrac = modf(v, &tint);
-    *p += ((int) tint);
-    return tfrac;
-}
-
 // TODO merge with __sum_block_sync
 // FIXME assumes blockDim being multiple of 2
 __device__ bool __xor_block_sync(bool v) {
@@ -214,6 +207,13 @@ __device__ bool __xor_block_sync(bool v) {
     return vv[0];
 }
 
+__device__ double modf_p(double v, int *p) {
+    double tfrac, tint;
+    tfrac = modf(v, &tint);
+    *p += ((int) tint);
+    return tfrac;
+}
+
 __global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
     const unsigned k = threadIdx.x;
     const unsigned m = ms[k];
@@ -227,9 +227,11 @@ __global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, 
     unsigned n = ns[k];
     int stops = 0;
 
-    __shared__ double ranks[1024];
+    __shared__ unsigned long long ranks[1024];
     __shared__ int rankp[1024];
     __shared__ int termp[1024];
+
+    if(threadIdx.x == 0) printf("blockdim: %d\n", blockDim.x);
 
     while(limit == 0 || stops < limit) {
 
@@ -243,24 +245,32 @@ __global__ void collatz_delay(int *ret, unsigned K, unsigned *ms, unsigned *ns, 
             rank = modf_p(rank, &pp);
             rank = modf_p(((double) n) * rank, &pp);
 
-            ranks[threadIdx.x] = rank;
+            unsigned long long rank_fracs = rank * (1ULL<<63);
+
+            ranks[threadIdx.x] = rank_fracs;
             rankp[threadIdx.x] = pp;
             for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                __syncthreads();
                 if (threadIdx.x < stride) {
-                    double r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
+                    unsigned long long r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
                     int p = rankp[threadIdx.x] + rankp[threadIdx.x + stride];
-                    r = modf_p(r, &p);
-                    ranks[threadIdx.x] = r;
-                    rankp[threadIdx.x] = p;
+                    ranks[threadIdx.x] = r & 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
+                    rankp[threadIdx.x] = p + (1 & (r >> 63));
                 }
                 __syncthreads();
             }
-            if(threadIdx.x == 0) ranks[0] = modf_p(ranks[0] + 1e-3, &rankp[0]);
+            if(threadIdx.x == 0) {
+                ranks[0] += 0x0010000000000000ULL;
+                rankp[0] += 1 & (ranks[0] >> 63);
+                ranks[0] &= 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
+            }
             __syncthreads();
-            double rank_total = ranks[0];
+            //if(threadIdx.x == 0) printf("%016llx\n", ranks[0]);
+            double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
             int rank_parity = rankp[0];
 
             if(log==2 && threadIdx.x==0) printf("pp=%d, rank=%lf, rank_total=%lf, rank_parity=%d\n", pp, rank, rank_total, rank_parity);
+            __syncthreads();
 
             int term_parity = (((unsigned long) n) * M_) % 2;
             //bool terms_parity = __xor_block_sync(term_parity);
@@ -467,7 +477,7 @@ int main(int argc, char **argv) {
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
     if(sel <= 3) 
-        test_compare_str(K, host_ms, n, sel, limit, 2);
+        test_compare_str(K, host_ms, n, sel, limit, 1);
     else {
         host_collatz_steps(n, 10);
         device_collatz_steps(K, host_ms, n, 10);
