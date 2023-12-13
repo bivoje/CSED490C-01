@@ -218,23 +218,59 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             parity[threadIdx.x] = pp ^ term_parity; 
 
             // FIXME assumes blockDim being multiple of 2
-            for (unsigned stride = blockDim.x / 2; stride > 1; stride >>= 1) { // TODO unroll last warp
+            for (unsigned stride = blockDim.x / 2; stride > 32; stride >>= 1) { // TODO unroll last warp
                 __syncthreads();
                 if (threadIdx.x < stride) {
-                    unsigned r = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
+                    unsigned f = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
                     bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
-                    fracs[threadIdx.x] = r & 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
-                    parity[threadIdx.x] = p ^ (r >> 31);
+                    fracs[threadIdx.x] = f & 0x7FFFFFFFU; // f & ((1ULL<<63)-1);
+                    parity[threadIdx.x] = p ^ (f >> 31);
                 }
             }
             if (threadIdx.x < 32) {
-                unsigned stride;
-                stride = 1; {
-                    unsigned r = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
-                    bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
-                    r += 0x00100000U;
-                    parity[threadIdx.x] = p ^ (r >> 31);
+                
+                unsigned stride = 32;
+                unsigned f = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
+                bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
+                p ^= (f >> 31);
+                f &= 0x7FFFFFFFU;
+
+                stride = 16; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
                 }
+
+                stride = 8; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                stride = 4; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                stride = 2; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                stride = 1; {
+                    f += __shfl_down_sync(0xFFFFFFF, f, 1, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFF, p, 1, 32);
+                    f += 0x00100000U;
+                    p ^= (f >> 31);
+                }
+
+                if(threadIdx.x == 0) parity[0] = p;
             }
 
             __syncthreads();
