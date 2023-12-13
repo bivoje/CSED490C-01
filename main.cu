@@ -200,8 +200,8 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
     unsigned n = ns[blockIdx.x * K + k];
     int stops = 0;
 
-    __shared__ unsigned ranks[1024];
-    __shared__ bool rankp[1024];
+    __shared__ unsigned fracs[1024];
+    __shared__ bool parity[1024];
 
     while(limit == 0 || stops < limit) {
 
@@ -214,29 +214,32 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             unsigned rank_fracs = rank * (1U<<31);
             bool term_parity = (1 & n) * (1 & M_);
 
-            ranks[threadIdx.x] = rank_fracs;
-            rankp[threadIdx.x] = pp ^ term_parity; 
+            fracs[threadIdx.x] = rank_fracs;
+            parity[threadIdx.x] = pp ^ term_parity; 
 
             // FIXME assumes blockDim being multiple of 2
-            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+            for (unsigned stride = blockDim.x / 2; stride > 1; stride >>= 1) { // TODO unroll last warp
                 __syncthreads();
                 if (threadIdx.x < stride) {
-                    unsigned r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
-                    bool p = rankp[threadIdx.x] ^ rankp[threadIdx.x + stride];
-                    ranks[threadIdx.x] = r & 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
-                    rankp[threadIdx.x] = p ^ (1 & (r >> 31));
+                    unsigned r = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
+                    bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
+                    fracs[threadIdx.x] = r & 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
+                    parity[threadIdx.x] = p ^ (r >> 31);
                 }
             }
-            if(threadIdx.x == 0) {
-                ranks[0] += 0x00100000U;
-                rankp[0] ^= 1 & (ranks[0] >> 31);
-                ranks[0] &= 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
+            if (threadIdx.x < 32) {
+                unsigned stride;
+                stride = 1; {
+                    unsigned r = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
+                    bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
+                    r += 0x00100000U;
+                    parity[threadIdx.x] = p ^ (r >> 31);
+                }
             }
+
             __syncthreads();
 
-            //double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
-            bool parity = rankp[0];
-            is_even = !parity;
+            is_even = !parity[0];
 
             //if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
             //if(log==2 && threadIdx.x==0) printf("pp=%d, rank=%lf, rank_total=%lf, rank_parity=%d\n", pp, rank, rank_total, rank_parity);
