@@ -202,7 +202,6 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
 
     __shared__ unsigned ranks[1024];
     __shared__ bool rankp[1024];
-    __shared__ bool termp[1024];
 
     while(limit == 0 || stops < limit) {
 
@@ -216,21 +215,17 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             bool term_parity = (1 & n) * (1 & M_);
 
             ranks[threadIdx.x] = rank_fracs;
-            rankp[threadIdx.x] = pp;
-            termp[threadIdx.x] = term_parity;
-
-            __syncthreads();
+            rankp[threadIdx.x] = pp ^ term_parity; 
 
             // FIXME assumes blockDim being multiple of 2
             for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                __syncthreads();
                 if (threadIdx.x < stride) {
                     unsigned r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
                     bool p = rankp[threadIdx.x] ^ rankp[threadIdx.x + stride];
                     ranks[threadIdx.x] = r & 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
                     rankp[threadIdx.x] = p ^ (1 & (r >> 31));
-                    termp[threadIdx.x] ^= termp[threadIdx.x + stride];
                 }
-                __syncthreads();
             }
             if(threadIdx.x == 0) {
                 ranks[0] += 0x00100000U;
@@ -240,9 +235,7 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             __syncthreads();
 
             //double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
-            bool rank_parity = rankp[0];
-            bool terms_parity = termp[0];
-            bool parity = rank_parity ^ terms_parity;
+            bool parity = rankp[0];
             is_even = !parity;
 
             //if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
