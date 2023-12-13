@@ -380,6 +380,21 @@ void test_compare_str(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int s
         gmp_printf(": %3d %c %3d\n", delay_host[t], (delay_host[t]==delay_device[t])?' ':'|', delay_device[t]);
 }
 
+void test_compare_str_(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int sel, unsigned limit, int log) {
+    int *delay_host = (int*) malloc(T * sizeof(int));
+    memset(delay_host, 0, T * sizeof(int));
+    float time_spent_cpu = 0;
+    if(sel & 1) for(int t=0; t<T; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu, log);
+
+    int *delay_device = (int*) malloc(T * sizeof(int));
+    memset(delay_device, 0, T * sizeof(int));
+    float time_spent_gpu = 0;
+    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, T, n, limit, &time_spent_gpu, log);
+
+    gmp_printf("%d\t%f\t%f\n", T, time_spent_cpu, time_spent_gpu);
+}
+
+
 unsigned host_ms8[] = {10007,3,5,7,11,13,17,19}; 
 
 unsigned host_ms64[] = {100003,100019,100043,100049,100057,100069,100103,100109,100129,100151,100153,100169,100183,100189,100193,100207,100213,100237,100267,100271,100279,100291,100297,100313,100333,100343,100357,100361,100363,100379,100391,100393,100403,100411,100417,100447,100459,100469,100483,100493,100501,100511,100517,100519,100523,100537,100547,100549,100559,100591,100609,100613,100621,100649,100669,100673,100693,100699,100703,100733,100741,100747,100769,100787,}; 
@@ -468,12 +483,13 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-#define T 64
 int _main(int argc, char **argv) {
 
     char *num = 
         #include "num"
     ;
+
+    int T = atoi(argv[1]);
 
     mpz_t nums[T];
     for(int t=0; t<T; t++) {
@@ -481,7 +497,7 @@ int _main(int argc, char **argv) {
         mpz_set_str(nums[t], num, 10);
     }
 
-    test_compare_str(1024, host_ms1024, T, nums, 3, 148624, 0);
+    test_compare_str_(1024, host_ms1024, T, nums, 3, 148624, 0);
 
     return 0;
 }
