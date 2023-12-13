@@ -180,10 +180,10 @@ __device__ int mod_inv(int m, int x) {
     }
 }
 
-__device__ double modf_p(double v, int *p) {
+__device__ double modf_p(double v, bool *p) {
     double tfrac, tint;
     tfrac = modf(v, &tint);
-    *p += ((int) tint);
+    *p ^= 1 & ((int) tint);
     return tfrac;
 }
 
@@ -200,8 +200,8 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
     unsigned n = ns[blockIdx.x * K + k];
     int stops = 0;
 
-    __shared__ unsigned long long ranks[1024];
-    __shared__ int rankp[1024];
+    __shared__ unsigned ranks[1024];
+    __shared__ bool rankp[1024];
     __shared__ bool termp[1024];
 
     while(limit == 0 || stops < limit) {
@@ -209,10 +209,10 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
         bool is_one = __all_block_sync(n == 1);
         bool is_even; {
             double rank = ((double) M_) / (double) m;
-            int pp = 0;
+            bool pp = 0;
             rank = modf_p(rank, &pp);
             rank = modf_p(((double) n) * rank, &pp);
-            unsigned long long rank_fracs = rank * (1ULL<<63);
+            unsigned rank_fracs = rank * (1U<<31);
             bool term_parity = (1 & n) * (1 & M_);
 
             ranks[threadIdx.x] = rank_fracs;
@@ -224,25 +224,25 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             // FIXME assumes blockDim being multiple of 2
             for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
                 if (threadIdx.x < stride) {
-                    unsigned long long r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
-                    int p = rankp[threadIdx.x] + rankp[threadIdx.x + stride];
-                    ranks[threadIdx.x] = r & 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
-                    rankp[threadIdx.x] = p + (1 & (r >> 63));
+                    unsigned r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
+                    bool p = rankp[threadIdx.x] ^ rankp[threadIdx.x + stride];
+                    ranks[threadIdx.x] = r & 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
+                    rankp[threadIdx.x] = p ^ (1 & (r >> 31));
                     termp[threadIdx.x] ^= termp[threadIdx.x + stride];
                 }
                 __syncthreads();
             }
             if(threadIdx.x == 0) {
-                ranks[0] += 0x0010000000000000ULL;
-                rankp[0] += 1 & (ranks[0] >> 63);
-                ranks[0] &= 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
+                ranks[0] += 0x00100000U;
+                rankp[0] ^= 1 & (ranks[0] >> 31);
+                ranks[0] &= 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
             }
             __syncthreads();
 
             //double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
-            bool rank_parity = 1 & rankp[0];
+            bool rank_parity = rankp[0];
             bool terms_parity = termp[0];
-            bool parity = 1 & (rank_parity ^ terms_parity);
+            bool parity = rank_parity ^ terms_parity;
             is_even = !parity;
 
             //if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
