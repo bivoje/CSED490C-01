@@ -55,16 +55,17 @@ int _host_collatz_delay(mpz_t n, unsigned limit, int log=0) {
     int stops = 0;
     while(limit == 0 || stops < limit && mpz_cmp_ui(n, 1) != 0) {
         if(mpz_even_p(n)) {
-            if(log==1) printf("0 ");
+            //if(log==1) printf("0 ");
             mpz_divexact_ui(n, n, 2);
         } else {
-            if(log==1) printf("1 ");
+            //if(log==1) printf("1 ");
             mpz_mul_ui(n, n, 3);
+            //mpz_mul(n, n, n);
             mpz_add_ui(n, n, 1);
         }
         stops += 1;
     }
-    if(log==1) printf("\n");
+    //if(log==1) printf("\n");
 
     if(mpz_cmp_ui(n, 1) == 0)
         return stops;
@@ -196,7 +197,7 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
     }
     const unsigned M_ = _M_; 
 
-    unsigned n = ns[k];
+    unsigned n = ns[blockIdx.x * K + k];
     int stops = 0;
 
     __shared__ unsigned long long ranks[1024];
@@ -258,37 +259,40 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             //if(log==1) if(threadIdx.x==0) printf("1 ");
             // FIXME assume m < UINTMAX/3
             n *= 3; n += 1; n %= m;
+            //n *= n; n += 1; n %= m;
         }
         stops += 1;
     }
 
-    ns[k] = n;
-    if(log==1) if(threadIdx.x==0) printf("\n");
+    ns[blockIdx.x * K + k] = n;
+
+    //if(log==1) if(threadIdx.x==0) printf("\n");
 
     if(k == 0)
         if(limit == 0 || stops < limit) 
-            *ret = stops;
+            ret[blockIdx.x] = stops;
         else
-            *ret = -1;
+            ret[blockIdx.x] = -1;
 }
 
 struct collatz_delay_t {
-    unsigned K;
+    unsigned K, T;
     unsigned *host_ns;
     unsigned *device_ms, *device_ns;
     cudaEvent_t start, stop;
 };
 
-void device_collatz_init(struct collatz_delay_t *A, unsigned K, unsigned *host_ms, mpz_t n) {
+void device_collatz_init(struct collatz_delay_t *A, unsigned K, unsigned *host_ms, unsigned T, mpz_t *n) {
     A->K = K;
+    A->T = T;
 
-    A->host_ns = (unsigned*) malloc(K * sizeof(unsigned));
-    host_int2crt(A->host_ns, K, host_ms, n);
+    A->host_ns = (unsigned*) malloc(T * K * sizeof(unsigned));
+    for(int t=0; t<T; t++) host_int2crt(&A->host_ns[K*t], K, host_ms, n[t]);
 
     cudaMalloc((void **)&A->device_ms, K * sizeof(unsigned));
-    cudaMalloc((void **)&A->device_ns, K * sizeof(unsigned));
+    cudaMalloc((void **)&A->device_ns, T * K * sizeof(unsigned));
     cudaMemcpy(A->device_ms, host_ms, K * sizeof(unsigned), cudaMemcpyHostToDevice);
-    cudaMemcpy(A->device_ns, A->host_ns, K * sizeof(unsigned), cudaMemcpyHostToDevice);
+    cudaMemcpy(A->device_ns, A->host_ns, T * K * sizeof(unsigned), cudaMemcpyHostToDevice);
 
     cudaEventCreate(&A->start);
     cudaEventCreate(&A->stop);
@@ -304,18 +308,18 @@ void device_collatz_free(struct collatz_delay_t *A) {
     cudaEventDestroy(A->stop);
 }
 
-int device_collatz_kernel(struct collatz_delay_t *A, unsigned limit, float *time, int log=0) {
-    int blockDim = A->K; // 1024;
-    int gridDim = 1; //saturating_div(K, blockDim);
+void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit, float *time, int log=0) {
+    int blockDim = A->K; // 1024 max;
+    int gridDim = A->T;
 
-    int host_delay, *device_delay;
-    cudaMalloc((void **)&device_delay, sizeof(int));
+    int *device_delay;
+    cudaMalloc((void **)&device_delay, A->T * sizeof(int));
 
     cudaEventRecord(A->start, 0);
     collatz_delay_kernel<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit, log);
     cudaEventRecord(A->stop, 0);
 
-    cudaMemcpy(&host_delay, device_delay, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(delay, device_delay, A->T * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(A->host_ns, A->device_ns, A->K * sizeof(unsigned), cudaMemcpyDeviceToHost);
 
     cudaFree(device_delay);
@@ -323,45 +327,45 @@ int device_collatz_kernel(struct collatz_delay_t *A, unsigned limit, float *time
     float ms;
     cudaEventElapsedTime(&ms, A->start, A->stop);
     if(time != NULL) *time += ms;
-
-    return host_delay;
 }
 
-int device_collatz_delay(unsigned K, unsigned *host_ms, mpz_t n, unsigned limit, float *time, int log=0) {
+void device_collatz_delay(int *delay, unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, unsigned limit, float *time, int log=0) {
     struct collatz_delay_t A;
-    device_collatz_init(&A, K, host_ms, n);
-    int delay = device_collatz_kernel(&A, limit, time, log);
+    device_collatz_init(&A, K, host_ms, T, n);
+    device_collatz_kernel(delay, &A, limit, time, log);
     device_collatz_free(&A);
-
-    return delay;
 }
 
-void device_collatz_steps(unsigned K, unsigned *host_ms, mpz_t n, int repeat, int log=0) {
-    gmp_printf("%d G| -> %Zd\n", 0, n);
+// T = 1 assumed. but for some reason, I have to get 'n' as a pointer
+void device_collatz_steps(unsigned K, unsigned *host_ms, mpz_t *n, int repeat, int log=0) {
+    gmp_printf("%d G| -> %Zd\n", 0, *n);
     struct collatz_delay_t A;
-    device_collatz_init(&A, K, host_ms, n);
+    device_collatz_init(&A, K, host_ms, 1, n);
+    int ret;
     for(int i=1; i<=repeat; i++) {
-        device_collatz_kernel(&A, 1, NULL, log);
-        mpz_t t; mpz_init(t);
-        host_crt2int(t, K, host_ms, A.host_ns);
-        gmp_printf("%d G| -> %Zd\n", i, t);
+        device_collatz_kernel(&ret, &A, 1, NULL, log);
+        mpz_t x; mpz_init(x);
+        host_crt2int(x, K, host_ms, A.host_ns);
+        gmp_printf("%d G| -> %Zd\n", i, x);
     }
     device_collatz_free(&A);
 }
 
-void test_compare_str(unsigned K, unsigned *host_ms, mpz_t n, int sel, unsigned limit, int log) {
-    int delay_host   = 0;
+void test_compare_str(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int sel, unsigned limit, int log) {
+    int *delay_host = (int*) malloc(T * sizeof(int));
+    memset(delay_host, 0, T * sizeof(int));
     float time_spent_cpu = 0;
-    if(sel & 1) delay_host = host_collatz_delay(n, limit, &time_spent_cpu, log);
+    if(sel & 1) for(int t=0; t<T; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu, log);
     gmp_printf("cpu time: \t%f ms\t\n", time_spent_cpu);
 
-    int delay_device = 0;
+    int *delay_device = (int*) malloc(T * sizeof(int));
+    memset(delay_device, 0, T * sizeof(int));
     float time_spent_gpu = 0;
-    if(sel & 2) delay_device = device_collatz_delay(K, host_ms, n, limit, &time_spent_gpu, log);
+    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, T, n, limit, &time_spent_gpu, log);
     gmp_printf("gpu time: \t%f ms\n", time_spent_gpu);
 
-    //if(delay_host==delay_device)
-    gmp_printf(": %3d %c %3d\n", delay_host, (delay_host==delay_device)?' ':'|', delay_device);
+    for(int t=0; t<T; t++) // if(delay_host!=delay_device)
+        gmp_printf(": %3d %c %3d\n", delay_host[t], (delay_host[t]==delay_device[t])?' ':'|', delay_device[t]);
 }
 
 unsigned host_ms8[] = {10007,3,5,7,11,13,17,19}; 
@@ -439,10 +443,10 @@ int main(int argc, char **argv) {
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
     if(sel <= 3) 
-        test_compare_str(K, host_ms, n, sel, limit, 0);
+        test_compare_str(K, host_ms, 1, &n, sel, limit, 0);
     else if(sel == 4) {
         host_collatz_steps(n, 10);
-        device_collatz_steps(K, host_ms, n, 10);
+        device_collatz_steps(K, host_ms, &n, 10);
     } else if(sel == 5) {
         int base = 10;
         size_t maxbits = host_collatz_maxbits(n, limit, base);
@@ -452,34 +456,24 @@ int main(int argc, char **argv) {
     return 0;
 }
 
+#define T 64
 int _main(int argc, char **argv) {
-    //for(int i=1000000; i>0; i--) test_compare(i, false);
 
-    //test_compare_ui(987654321, true);
+    char *num = 
+        #include "num"
+    ;
 
-    //int _n = 1438;
-    //mpz_t n; mpz_init(n); mpz_set_ui(n, _n);
-    //collatz_step_device(K, host_ms, n, 1);
-    //gmp_printf("%d -> %Zd\n", _n, n);
+    mpz_t nums[T];
+    for(int t=0; t<T; t++) {
+        mpz_init(nums[t]);
+        mpz_set_str(nums[t], num, 10);
+    }
 
-    //#define L 2000
-    //char str[L]; for(int i=0; i<L; i++) str[i] = '9'; str[L-1] = 0;
-    //mpz_t n; mpz_init(n); mpz_set_str(n, str, 10);
-    //while(1) {
-    //    mpz_sub_ui(n, n, 1);
-    //    test_compare_str(n, false);
-    //}
-
-    //char *str = "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999995";
-
-    char *str =
-#include "num"
-        ;
-    mpz_t n; mpz_init(n); mpz_set_str(n, str, 10);
-    test_compare_str(1024, host_ms1024, n, 3, 100000, false);
+    test_compare_str(1024, host_ms1024, T, nums, 3, 148624, 0);
 
     return 0;
 }
+
 // TODO baseline? https://github.com/kisupov/grns/blob/master/src/mpint.cuh 
 // TODO REF:https://pdf.sciencedirectassets.com/271503/1-s2.0-S0898122105X08604/1-s2.0-S0898122105002890/main.pdf?X-Amz-Security-Token=IQoJb3JpZ2luX2VjEAEaCXVzLWVhc3QtMSJGMEQCIGo1xFIcj66pOtfY6J%2FYcPJvyOn%2BkUzr20%2FacIZlg4SmAiB9MkoM3AMGjPu8HAzaIimJ20J%2FAip0xTxYnAsd7hejyiqyBQhqEAUaDDA1OTAwMzU0Njg2NSIMQWrqhooi4lWCxZ4TKo8FZRHzLS5gGO4ZpPqix9%2BkifkwMuj%2FK4tZpNBetzdoAzrH0GmHHjz50jhkzhp4WdWiETH%2FLQVn10XIW%2F65r2P5Nc7pyBulLDTjgyZNEkfZRlAYm5JMPBcx%2BLu%2BJ8yIvCgWxTfN65XjvlajCWw8UoeqCSn7wm0rktUYdDaAPNaM4%2Bin0AwTic2Mnm9G%2BRnFarmCcebJKnepFN8D0kywMm62%2BjvCXSR9p0zdrtCrJC2fk3VJUKCJE2ZNvcOKIXD%2FsVYg4h2bcBAx0t3EOwQOiH0ZrMavh2XMyXEH2AfzrK2jKBgiWE3mkBOF7OcgxbT8mN18LywQXf4GKdCbZesQxp3NlUFIQx9pNUU6wfgHaSKSzlq%2BkwMqLGGnA2Q8IoLwMkPc5XjcuBB0aTXOkOkwHLQxE1TWRqaJbLdUuJG6jqLmtMhQJUyKEwS%2FlA%2BRlRrcdNtrPMYsOP0YPLmwLVwNU619XFrjvF%2Ffp5N4iq%2BUb6PHwEKu2IImlWPrQTvIGAlAFRcdnh5SsNo%2B18TA20tSaoIfrun%2F9G%2B2SCcxPrnuxHmdqwnJEg37q2lfQ2MmW4DdowlGCcnVP6oscRfpaj3fU%2BvLozc9xwv6Q1vqPCHaLvNepqiGJLyjFvIqwo7Zsp98mFV2AfMjFSsEaWkpquX3uuAovFvb3B3eS2TurQAyJetQLA5vT7GwdFEv7EjJCWvOGS9wJ6WfHqfF1aRG21WqnLXvm%2BLEZMr5jKMGqTxCeUHhs7RLlbpBdTPkFaSkycmurFNUIFpfvM%2Bxlf8aOM9GceWTupP8YYcqBeXWC6vaiynmw1oGDo2DIeXjzNMMnuiCVgcU2BiRRa9N5kYVwRPD4%2FuUh%2FGqCiZ2AlqKXNv90ukPKDCN3bmrBjqyAbcy6POXsO4CMMY2UmTuMaxRiSCkCfdepdi3Ktu9Gd%2F%2Ff2pQ3TJoe6yN3blB1YMS0ZwO1svNnAgfk8z7mAN7%2BiCMp5aBGBxH4LN8A0anwhLA%2FJcxlLWoMTno9HLiDqA2YaUfjQa4NdE5JL96oDV5MierdaKecKZ0zmXGOW3s7nXEmJvF4Xqlvl8c92IheBpt7Gkt4Ul4Y%2FXgyIG8solI%2F0r64QSdvqyAD1ejXgf1D57jhu8%3D&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20231205T014736Z&X-Amz-SignedHeaders=host&X-Amz-Expires=300&X-Amz-Credential=ASIAQ3PHCVTY4AIUGWIT%2F20231205%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=d8c84771daf4ce33785a1c6cba18745d84674cfeb3534c584412ab0c389a1c91&hash=bd0fd1bf729c1c1e273ccae0dcf1ca93cb83157d1e40f578516367132744b5fe&host=68042c943591013ac2b2430a89b270f6af2c76d8dfd086a07176afe7c76c2c61&pii=S0898122105002890&tid=spdf-0c438e76-d7a8-4f07-a20b-1993fbeba9bc&sid=fea44b6a49440649f418d659643dc372823fgxrqa&type=client&tsoh=d3d3LnNjaWVuY2VkaXJlY3QuY29t&ua=0d125e5251595b025202&rr=83089f3db8ceedb5&cc=kr 
 // TODO REF:https://www.sciencedirect.com/science/article/pii/S0898122105002890?via%3Dihub
