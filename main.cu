@@ -394,6 +394,20 @@ void test_compare_str_(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int 
     gmp_printf("%d\t%f\t%f\n", T, time_spent_cpu, time_spent_gpu);
 }
 
+void test_compare_str__(unsigned K, unsigned *host_ms, unsigned N, mpz_t *n, int sel, unsigned limit, int log) {
+    int *delay_host = (int*) malloc(1 * sizeof(int));
+    memset(delay_host, 0, 1 * sizeof(int));
+    float time_spent_cpu = 0;
+    if(sel & 1) for(int t=0; t<1; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu, log);
+
+    int *delay_device = (int*) malloc(1 * sizeof(int));
+    memset(delay_device, 0, 1 * sizeof(int));
+    float time_spent_gpu = 0;
+    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, 1, n, limit, &time_spent_gpu, log);
+
+    gmp_printf("%d\t%d\t%d\t%f\t%f\n", N, delay_host[0], delay_device[0], time_spent_cpu, time_spent_gpu);
+}
+
 
 unsigned host_ms8[] = {10007,3,5,7,11,13,17,19}; 
 
@@ -405,7 +419,7 @@ unsigned host_ms1024[] = {
 
 #include <math.h>
 
-int main(int argc, char **argv) {
+int __main(int argc, char **argv) {
     char *num = "10";
     if(argc > 1) {
         num = argv[1];
@@ -489,7 +503,7 @@ int _main(int argc, char **argv) {
         #include "num"
     ;
 
-    int T = atoi(argv[1]);
+    int T = 1 << atoi(argv[1]);
 
     mpz_t nums[T];
     for(int t=0; t<T; t++) {
@@ -498,6 +512,25 @@ int _main(int argc, char **argv) {
     }
 
     test_compare_str_(1024, host_ms1024, T, nums, 3, 148624, 0);
+
+    return 0;
+}
+
+char num[7000];
+int main(int argc, char **argv) {
+
+    char *_num =
+        #include "num"
+    ;
+
+    int N = 1 << atoi(argv[1]);
+    strncpy(num, _num, N);
+
+    mpz_t nums;
+    mpz_init(nums);
+    mpz_set_str(nums, num, 10);
+
+    test_compare_str__(1024, host_ms1024, N, &nums, 3, 148624, 0);
 
     return 0;
 }
