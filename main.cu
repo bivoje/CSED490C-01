@@ -55,17 +55,17 @@ int _host_collatz_delay(mpz_t n, unsigned limit, int log=0) {
     int stops = 0;
     while(limit == 0 || stops < limit && mpz_cmp_ui(n, 1) != 0) {
         if(mpz_even_p(n)) {
-            //if(log==1) printf("0 ");
+            if(log==1) printf("0 ");
             mpz_divexact_ui(n, n, 2);
         } else {
-            //if(log==1) printf("1 ");
+            if(log==1) printf("1 ");
             mpz_mul_ui(n, n, 3);
             //mpz_mul(n, n, n);
             mpz_add_ui(n, n, 1);
         }
         stops += 1;
     }
-    //if(log==1) printf("\n");
+    if(log==1) printf("\n");
 
     if(mpz_cmp_ui(n, 1) == 0)
         return stops;
@@ -128,8 +128,13 @@ size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base, int log=0) {
 // =====================================
 // device collatz
 
+#define BLOCK_SIZE 1024
+
 __device__ bool __all_block_sync(bool v) {
     __shared__ int vv[32];
+    if(threadIdx.x < 32) {
+        vv[threadIdx.x] = 1;
+    }
 
     v = __all_sync(0xFFFFFFFF, v);
 
@@ -188,35 +193,63 @@ __device__ double modf_p(double v, bool *p) {
 }
 
 __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
-    const unsigned k = threadIdx.x;
-    const unsigned m = ms[k];
-    unsigned _M_; {
-        unsigned long M = 1;
-        for(int i=0; i<K; i++) if(k != i) { M *= ms[i]; M %= m; }
-        _M_ = mod_inv(m, M);
+    const unsigned k1 = threadIdx.x;
+    const unsigned k2 = threadIdx.x + blockDim.x ;
+    const unsigned m1 = ms[k1];
+    const unsigned m2 = ms[k2];
+    unsigned _M1_, _M2_; {
+        unsigned long M1 = 1, M2 = 1;
+        for(int i=0; i<K; i++) {
+            if(k1 != i) { M1 *= ms[i]; M1 %= m1; }
+            if(k2 != i) { M2 *= ms[i]; M2 %= m2; }
+        }
+        _M1_ = mod_inv(m1, M1);
+        _M2_ = mod_inv(m2, M2);
     }
-    const unsigned M_ = _M_; 
+    const unsigned M1_ = _M1_; 
+    const unsigned M2_ = _M2_; 
 
-    unsigned n = ns[blockIdx.x * K + k];
+    unsigned n1 = ns[blockIdx.x * K + k1];
+    unsigned n2 = ns[blockIdx.x * K + k2];
     int stops = 0;
 
     __shared__ unsigned rfracs[32];
     __shared__ bool parity[32];
 
     while(limit == 0 || stops < limit) {
+        bool is_one = __all_block_sync(((n1 == 1) && (n2 == 1)));
 
-        bool is_one = __all_block_sync(n == 1);
         bool is_even; {
-            double rank = ((double) M_) / (double) m;
-            bool pp = 0;
-            rank = modf_p(rank, &pp);
-            rank = modf_p(((double) n) * rank, &pp);
-            unsigned rank_rfracs = rank * (1U<<31);
-            bool term_parity = (1 & n) * (1 & M_);
 
+            unsigned f;
+            bool p;
 
-            unsigned f = rank_rfracs;
-            bool p = pp ^ term_parity; 
+            {
+                double rank = ((double) M1_) / (double) m1;
+                bool pp = 0;
+                rank = modf_p(rank, &pp);
+                rank = modf_p(((double) n1) * rank, &pp);
+                unsigned rank_rfracs = rank * (1U<<31);
+                bool term_parity = (1 & n1) * (1 & M1_);
+
+                f = rank_rfracs;
+                p = pp ^ term_parity; 
+            }
+
+            {
+                double rank = ((double) M2_) / (double) m2;
+                bool pp = 0;
+                rank = modf_p(rank, &pp);
+                rank = modf_p(((double) n2) * rank, &pp);
+                unsigned rank_rfracs = rank * (1U<<31);
+                bool term_parity = (1 & n2) * (1 & M2_);
+
+                f += rank_rfracs;
+                p ^= pp ^ term_parity;
+                p ^= (f >> 31);
+                f &= 0x7FFFFFFFU;
+            }
+
 
             for(unsigned stride = 32/2; stride > 0; stride >>= 1) {
                 f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
@@ -224,6 +257,11 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
                 p ^= (f >> 31);
                 f &= 0x7FFFFFFFU;
             }
+
+            //if (threadIdx.x < 32) {
+            //    rfracs[threadIdx.x] = 0;
+            //    parity[threadIdx.x] = 0;
+            //}
 
             if(threadIdx.x % 32 == 0) {
                 rfracs[threadIdx.x / 32] = f;
@@ -256,31 +294,30 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             __syncthreads();
 
             is_even = !parity[0];
-
-            //if(log==2 && threadIdx.x==0) printf("term=%d, terms=%d\n", term_parity, terms_parity);
-            //if(log==2 && threadIdx.x==0) printf("pp=%d, rank=%lf, rank_total=%lf, rank_parity=%d\n", pp, rank, rank_total, rank_parity);
-            //if(log==2 && threadIdx.x==0) printf("parity=%d\n", parity);
         }
 
         if (is_one) break;
 
         if(is_even) {
-            //if(log==1) if(threadIdx.x==0) printf("0 ");
-            n = div2(m, n); n %= m;
+            if(log==1) if(threadIdx.x==0) printf("0 ");
+            n1 = div2(m1, n1); n1 %= m1;
+            n2 = div2(m2, n2); n2 %= m2;
         } else {
-            //if(log==1) if(threadIdx.x==0) printf("1 ");
+            if(log==1) if(threadIdx.x==0) printf("1 ");
             // FIXME assume m < UINTMAX/3
-            n *= 3; n += 1; n %= m;
+            n1 *= 3; n1 += 1; n1 %= m1;
+            n2 *= 3; n2 += 1; n2 %= m2;
             //n *= n; n += 1; n %= m;
         }
         stops += 1;
     }
 
-    ns[blockIdx.x * K + k] = n;
+    ns[blockIdx.x * K + k1] = n1;
+    ns[blockIdx.x * K + k2] = n2;
 
-    //if(log==1) if(threadIdx.x==0) printf("\n");
+    if(log==1) if(threadIdx.x==0) printf("\n");
 
-    if(k == 0)
+    if(k1 == 0)
         if(limit == 0 || stops < limit) 
             ret[blockIdx.x] = stops;
         else
@@ -321,7 +358,9 @@ void device_collatz_free(struct collatz_delay_t *A) {
 }
 
 void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit, float *time, int log=0) {
-    int blockDim = A->K; // 1024 max;
+    //assert(A->K % BLOCK_SIZE == 0);
+    //int blockDim = saturating_div(A->K, BLOCK_SIZE);
+    int blockDim = A->K / 2;
     int gridDim = A->T;
 
     int *device_delay;
@@ -413,13 +452,13 @@ unsigned host_ms8[] = {10007,3,5,7,11,13,17,19};
 
 unsigned host_ms64[] = {100003,100019,100043,100049,100057,100069,100103,100109,100129,100151,100153,100169,100183,100189,100193,100207,100213,100237,100267,100271,100279,100291,100297,100313,100333,100343,100357,100361,100363,100379,100391,100393,100403,100411,100417,100447,100459,100469,100483,100493,100501,100511,100517,100519,100523,100537,100547,100549,100559,100591,100609,100613,100621,100649,100669,100673,100693,100699,100703,100733,100741,100747,100769,100787,}; 
 
-unsigned host_ms1024[] = {
+unsigned host_ms2048[] = {
     #include "primes.list"
 };
 
 #include <math.h>
 
-int __main(int argc, char **argv) {
+int main(int argc, char **argv) {
     char *num = "10";
     if(argc > 1) {
         num = argv[1];
@@ -451,8 +490,8 @@ int __main(int argc, char **argv) {
         host_ms = host_ms8;
     } else if(size_level <= 6) {
         host_ms = host_ms64;
-    } else if(size_level <= 10) {
-        host_ms = host_ms1024;
+    } else if(size_level <= 11) {
+        host_ms = host_ms2048;
     } else {
         assert(false && "size_level too big");
     }
@@ -484,7 +523,7 @@ int __main(int argc, char **argv) {
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
     if(sel <= 3) 
-        test_compare_str(K, host_ms, 1, &n, sel, limit, 0);
+        test_compare_str(K, host_ms, 1, &n, sel, limit, 1);
     else if(sel == 4) {
         host_collatz_steps(n, 10);
         device_collatz_steps(K, host_ms, &n, 10);
@@ -497,7 +536,7 @@ int __main(int argc, char **argv) {
     return 0;
 }
 
-int _main(int argc, char **argv) {
+int __main(int argc, char **argv) {
 
     char *num = 
         #include "num"
@@ -511,13 +550,13 @@ int _main(int argc, char **argv) {
         mpz_set_str(nums[t], num, 10);
     }
 
-    test_compare_str_(1024, host_ms1024, T, nums, 3, 148624, 0);
+    test_compare_str_(1024, host_ms2048, T, nums, 3, 148624, 0);
 
     return 0;
 }
 
 char num[7000];
-int main(int argc, char **argv) {
+int _main(int argc, char **argv) {
 
     char *_num =
         #include "num"
@@ -530,7 +569,7 @@ int main(int argc, char **argv) {
     mpz_init(nums);
     mpz_set_str(nums, num, 10);
 
-    test_compare_str__(1024, host_ms1024, N, &nums, 3, 148624, 0);
+    test_compare_str__(1024, host_ms2048, N, &nums, 3, 148624, 0);
 
     return 0;
 }
