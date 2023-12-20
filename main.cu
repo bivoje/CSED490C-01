@@ -128,7 +128,8 @@ size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base, int log=0) {
 // =====================================
 // device collatz
 
-#define BLOCK_SIZE 1024
+#define saturating_div(A,B) (((A) + (B) - 1) / (B))
+#define BLOCK_MULT 4
 
 __device__ bool __all_block_sync(bool v) {
     __shared__ int vv[32];
@@ -193,56 +194,68 @@ __device__ double modf_p(double v, bool *p) {
 }
 
 __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
-    const unsigned k1 = threadIdx.x;
-    const unsigned k2 = threadIdx.x + blockDim.x ;
-    const unsigned m1 = ms[k1];
-    const unsigned m2 = ms[k2];
-    unsigned _M1_, _M2_; {
-        unsigned long M1 = 1, M2 = 1;
-        for(int i=0; i<K; i++) {
-            if(k1 != i) { M1 *= ms[i]; M1 %= m1; }
-            if(k2 != i) { M2 *= ms[i]; M2 %= m2; }
-        }
-        _M1_ = mod_inv(m1, M1);
-        _M2_ = mod_inv(m2, M2);
-    }
-    const unsigned M1_ = _M1_; 
-    const unsigned M2_ = _M2_; 
 
-    unsigned n1 = ns[blockIdx.x * K + k1];
-    unsigned n2 = ns[blockIdx.x * K + k2];
+    unsigned k[BLOCK_MULT], m[BLOCK_MULT];
+    for(int j=0; j<BLOCK_MULT; j++) {
+        k[j] = j * blockDim.x + threadIdx.x; // FIXME remove?
+        m[j] = ms[k[j]];
+        m[j] = ms[j * blockDim.x + threadIdx.x];
+    }
+
+    unsigned M_[BLOCK_MULT]; {
+        unsigned long M[BLOCK_MULT]; // FIXME remove?
+        for(int j=0; j<BLOCK_MULT; j++)
+            M[j] = 1;
+
+        for(int i=0; i<K; i++)
+            for(int j=0; j<BLOCK_MULT; j++)
+                if(k[j] != i) { M[j] *= ms[i]; M[j] %= m[j]; }
+
+        for(int j=0; j<BLOCK_MULT; j++)
+            M_[j] = mod_inv(m[j], M[j]);
+    }
+
+    unsigned n[BLOCK_MULT];
+    for(int j=0; j<BLOCK_MULT; j++)
+        n[j] = ns[blockIdx.x * K + k[j]];
+
     int stops = 0;
 
     __shared__ unsigned rfracs[32];
     __shared__ bool parity[32];
 
     while(limit == 0 || stops < limit) {
-        bool is_one = __all_block_sync(((n1 == 1) && (n2 == 1)));
+
+        bool is_one = true;
+        for(int j=0; j<BLOCK_MULT; j++)
+            is_one &= n[j] == 1;
+        is_one = __all_block_sync(is_one);
 
         bool is_even; {
 
-            unsigned f;
-            bool p;
+            unsigned f = 0;
+            bool p = false;
 
             {
-                double rank = ((double) M1_) / (double) m1;
+                double rank = ((double) M_[0]) / (double) m[0];
                 bool pp = 0;
                 rank = modf_p(rank, &pp);
-                rank = modf_p(((double) n1) * rank, &pp);
+                rank = modf_p(((double) n[0]) * rank, &pp);
                 unsigned rank_rfracs = rank * (1U<<31);
-                bool term_parity = (1 & n1) * (1 & M1_);
+                bool term_parity = (1 & n[0]) * (1 & M_[0]);
 
                 f = rank_rfracs;
                 p = pp ^ term_parity; 
             }
 
+            for(int j=1; j<BLOCK_MULT; j++) 
             {
-                double rank = ((double) M2_) / (double) m2;
+                double rank = ((double) M_[j]) / (double) m[j];
                 bool pp = 0;
                 rank = modf_p(rank, &pp);
-                rank = modf_p(((double) n2) * rank, &pp);
+                rank = modf_p(((double) n[j]) * rank, &pp);
                 unsigned rank_rfracs = rank * (1U<<31);
-                bool term_parity = (1 & n2) * (1 & M2_);
+                bool term_parity = (1 & n[j]) * (1 & M_[j]);
 
                 f += rank_rfracs;
                 p ^= pp ^ term_parity;
@@ -300,24 +313,26 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
 
         if(is_even) {
             if(log==1) if(threadIdx.x==0) printf("0 ");
-            n1 = div2(m1, n1); n1 %= m1;
-            n2 = div2(m2, n2); n2 %= m2;
+            for(int j=0; j<BLOCK_MULT; j++) {
+                n[j] = div2(m[j], n[j]); n[j] %= m[j];
+            }
         } else {
             if(log==1) if(threadIdx.x==0) printf("1 ");
             // FIXME assume m < UINTMAX/3
-            n1 *= 3; n1 += 1; n1 %= m1;
-            n2 *= 3; n2 += 1; n2 %= m2;
-            //n *= n; n += 1; n %= m;
+            for(int j=0; j<BLOCK_MULT; j++) {
+                n[j] *= 3; n[j] += 1; n[j] %= m[j];
+                //n *= n; n += 1; n %= m;
+            }
         }
         stops += 1;
     }
 
-    ns[blockIdx.x * K + k1] = n1;
-    ns[blockIdx.x * K + k2] = n2;
+    for(int j=0; j<BLOCK_MULT; j++)
+        ns[blockIdx.x * K + k[j]] = n[j];
 
     if(log==1) if(threadIdx.x==0) printf("\n");
 
-    if(k1 == 0)
+    if(threadIdx.x == 0)
         if(limit == 0 || stops < limit) 
             ret[blockIdx.x] = stops;
         else
@@ -358,15 +373,15 @@ void device_collatz_free(struct collatz_delay_t *A) {
 }
 
 void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit, float *time, int log=0) {
-    //assert(A->K % BLOCK_SIZE == 0);
-    //int blockDim = saturating_div(A->K, BLOCK_SIZE);
-    int blockDim = A->K / 2;
+    assert(A->K % BLOCK_MULT == 0); // FIXME
+    int blockDim = saturating_div(A->K, BLOCK_MULT);
     int gridDim = A->T;
 
     int *device_delay;
     cudaMalloc((void **)&device_delay, A->T * sizeof(int));
 
     cudaEventRecord(A->start, 0);
+    printf("collatz_delay_kernel<<<%d,%d>>>(ret, K=%d, ms, ns, limit=%d);\n", gridDim, blockDim, A->K, limit);
     collatz_delay_kernel<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit, log);
     cudaEventRecord(A->stop, 0);
 
