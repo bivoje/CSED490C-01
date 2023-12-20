@@ -128,8 +128,19 @@ size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base, int log=0) {
 // =====================================
 // device collatz
 
+#define CUDACHECK(stmt)                                                  \
+  do {                                                                    \
+    cudaError_t err = stmt;                                               \
+    if (err != cudaSuccess) {                                             \
+      printf("Failed to run stmt %s\n", #stmt);                      \
+      printf("Got CUDA error ...  %s\n", cudaGetErrorString(err));   \
+    }                                                                     \
+  } while (0)
+
+
 #define saturating_div(A,B) (((A) + (B) - 1) / (B))
-#define BLOCK_MULT 4
+#define BLOCK_MULT 2
+
 
 __device__ bool __all_block_sync(bool v) {
     __shared__ int vv[32];
@@ -194,35 +205,36 @@ __device__ double modf_p(double v, bool *p) {
 }
 
 __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
+    unsigned m[BLOCK_MULT];
+    unsigned M_[BLOCK_MULT];
+    unsigned n[BLOCK_MULT];
 
-    unsigned k[BLOCK_MULT], m[BLOCK_MULT];
     for(int j=0; j<BLOCK_MULT; j++) {
-        k[j] = j * blockDim.x + threadIdx.x; // FIXME remove?
-        m[j] = ms[k[j]];
+        unsigned k = j * blockDim.x + threadIdx.x;
+        m[j] = ms[k];
         m[j] = ms[j * blockDim.x + threadIdx.x];
     }
 
-    unsigned M_[BLOCK_MULT]; {
-        unsigned long M[BLOCK_MULT]; // FIXME remove?
-        for(int j=0; j<BLOCK_MULT; j++)
-            M[j] = 1;
-
-        for(int i=0; i<K; i++)
-            for(int j=0; j<BLOCK_MULT; j++)
-                if(k[j] != i) { M[j] *= ms[i]; M[j] %= m[j]; }
-
-        for(int j=0; j<BLOCK_MULT; j++)
-            M_[j] = mod_inv(m[j], M[j]);
+    for(int j=0; j<BLOCK_MULT; j++) {
+        unsigned long M = 1;
+        unsigned k = j * blockDim.x + threadIdx.x;
+        for(int i=0; i<K; i++) if(k != i) { M *= ms[i]; M %= m[j]; }
+        M_[j] = mod_inv(m[j], M);
     }
 
-    unsigned n[BLOCK_MULT];
-    for(int j=0; j<BLOCK_MULT; j++)
-        n[j] = ns[blockIdx.x * K + k[j]];
+    for(int j=0; j<BLOCK_MULT; j++) {
+        unsigned k = j * blockDim.x + threadIdx.x;
+        n[j] = ns[blockIdx.x * K + k];
+    }
 
     int stops = 0;
 
     __shared__ unsigned rfracs[32];
     __shared__ bool parity[32];
+    if (threadIdx.x < 32) {
+        rfracs[threadIdx.x] = 0;
+        parity[threadIdx.x] = 0;
+    }
 
     while(limit == 0 || stops < limit) {
 
@@ -270,11 +282,6 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
                 p ^= (f >> 31);
                 f &= 0x7FFFFFFFU;
             }
-
-            //if (threadIdx.x < 32) {
-            //    rfracs[threadIdx.x] = 0;
-            //    parity[threadIdx.x] = 0;
-            //}
 
             if(threadIdx.x % 32 == 0) {
                 rfracs[threadIdx.x / 32] = f;
@@ -327,8 +334,10 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
         stops += 1;
     }
 
-    for(int j=0; j<BLOCK_MULT; j++)
-        ns[blockIdx.x * K + k[j]] = n[j];
+    for(int j=0; j<BLOCK_MULT; j++) {
+        unsigned k = j * blockDim.x + threadIdx.x;
+        ns[blockIdx.x * K + k] = n[j];
+    }
 
     if(log==1) if(threadIdx.x==0) printf("\n");
 
@@ -353,13 +362,13 @@ void device_collatz_init(struct collatz_delay_t *A, unsigned K, unsigned *host_m
     A->host_ns = (unsigned*) malloc(T * K * sizeof(unsigned));
     for(int t=0; t<T; t++) host_int2crt(&A->host_ns[K*t], K, host_ms, n[t]);
 
-    cudaMalloc((void **)&A->device_ms, K * sizeof(unsigned));
-    cudaMalloc((void **)&A->device_ns, T * K * sizeof(unsigned));
-    cudaMemcpy(A->device_ms, host_ms, K * sizeof(unsigned), cudaMemcpyHostToDevice);
-    cudaMemcpy(A->device_ns, A->host_ns, T * K * sizeof(unsigned), cudaMemcpyHostToDevice);
+    CUDACHECK( cudaMalloc((void **)&A->device_ms, K * sizeof(unsigned)) );
+    CUDACHECK( cudaMalloc((void **)&A->device_ns, T * K * sizeof(unsigned)) );
+    CUDACHECK( cudaMemcpy(A->device_ms, host_ms, K * sizeof(unsigned), cudaMemcpyHostToDevice) );
+    CUDACHECK( cudaMemcpy(A->device_ns, A->host_ns, T * K * sizeof(unsigned), cudaMemcpyHostToDevice) );
 
-    cudaEventCreate(&A->start);
-    cudaEventCreate(&A->stop);
+    CUDACHECK( cudaEventCreate(&A->start) );
+    CUDACHECK( cudaEventCreate(&A->stop) );
 }
 
 void device_collatz_free(struct collatz_delay_t *A) {
@@ -378,17 +387,19 @@ void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit
     int gridDim = A->T;
 
     int *device_delay;
-    cudaMalloc((void **)&device_delay, A->T * sizeof(int));
+    CUDACHECK( cudaMalloc((void **)&device_delay, A->T * sizeof(int)) );
 
-    cudaEventRecord(A->start, 0);
-    printf("collatz_delay_kernel<<<%d,%d>>>(ret, K=%d, ms, ns, limit=%d);\n", gridDim, blockDim, A->K, limit);
+    CUDACHECK( cudaEventRecord(A->start, 0) );
+    if(log) printf("collatz_delay_kernel<<<%d,%d>>>(ret, K=%d, ms, ns, limit=%d);\n", gridDim,blockDim,A->K,limit);
+    cudaError_t err = cudaGetLastError();
+    printf("CUDAERR: %s\n", cudaGetErrorString(err));
     collatz_delay_kernel<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit, log);
-    cudaEventRecord(A->stop, 0);
+    CUDACHECK( cudaEventRecord(A->stop, 0) );
 
-    cudaMemcpy(delay, device_delay, A->T * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(A->host_ns, A->device_ns, A->K * sizeof(unsigned), cudaMemcpyDeviceToHost);
+    CUDACHECK( cudaMemcpy(delay, device_delay, A->T * sizeof(int), cudaMemcpyDeviceToHost) );
+    CUDACHECK( cudaMemcpy(A->host_ns, A->device_ns, A->K * sizeof(unsigned), cudaMemcpyDeviceToHost) );
 
-    cudaFree(device_delay);
+    CUDACHECK( cudaFree(device_delay) );
 
     float ms;
     cudaEventElapsedTime(&ms, A->start, A->stop);
@@ -467,7 +478,7 @@ unsigned host_ms8[] = {10007,3,5,7,11,13,17,19};
 
 unsigned host_ms64[] = {100003,100019,100043,100049,100057,100069,100103,100109,100129,100151,100153,100169,100183,100189,100193,100207,100213,100237,100267,100271,100279,100291,100297,100313,100333,100343,100357,100361,100363,100379,100391,100393,100403,100411,100417,100447,100459,100469,100483,100493,100501,100511,100517,100519,100523,100537,100547,100549,100559,100591,100609,100613,100621,100649,100669,100673,100693,100699,100703,100733,100741,100747,100769,100787,}; 
 
-unsigned host_ms2048[] = {
+unsigned host_ms10000[] = {
     #include "primes.list"
 };
 
@@ -483,10 +494,10 @@ int main(int argc, char **argv) {
             ;
     }
 
-    int size_level = 3;
+    int size= 8;
     if(argc > 2) {
-        size_level = atoi(argv[2]);
-        assert(size_level > 0 && "size_level needs to be positive");
+        size= atoi(argv[2]);
+        assert(size > 0 && "size needs to be positive");
     }
 
     int sel = 3;
@@ -501,16 +512,16 @@ int main(int argc, char **argv) {
     }
 
     unsigned *host_ms;
-    if(size_level <= 3) {
+    if(size <= 8) {
         host_ms = host_ms8;
-    } else if(size_level <= 6) {
+    } else if(size <= 64) {
         host_ms = host_ms64;
-    } else if(size_level <= 11) {
-        host_ms = host_ms2048;
+    } else if(size <= 10000) {
+        host_ms = host_ms10000;
     } else {
-        assert(false && "size_level too big");
+        assert(false && "size too big");
     }
-    unsigned K = 1 << size_level;
+    unsigned K = size;
 
     double maxlg = 0;
     for(int k=0; k<K; k++) maxlg += log10(host_ms[k]);
@@ -534,7 +545,7 @@ int main(int argc, char **argv) {
         gmp_printf("num: %s (~%.3fe%+d), ", num, max_mantissa, max_exponent);
     else 
         gmp_printf("num: %.3fe%+d (~%.3fe%+d), ", num_mantissa, num_exponent, max_mantissa, max_exponent);
-    gmp_printf("size_level: %d, sel: %c%c, limit:%u\n", size_level, sel&1?'c':'\0', sel&2?'g':'\0', limit);
+    gmp_printf("size: %d, sel: %c%c, limit:%u\n", size, sel&1?'c':'\0', sel&2?'g':'\0', limit);
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
     if(sel <= 3) 
@@ -565,7 +576,7 @@ int __main(int argc, char **argv) {
         mpz_set_str(nums[t], num, 10);
     }
 
-    test_compare_str_(1024, host_ms2048, T, nums, 3, 148624, 0);
+    test_compare_str_(1024, host_ms10000, T, nums, 3, 148624, 0);
 
     return 0;
 }
@@ -584,7 +595,7 @@ int _main(int argc, char **argv) {
     mpz_init(nums);
     mpz_set_str(nums, num, 10);
 
-    test_compare_str__(1024, host_ms2048, N, &nums, 3, 148624, 0);
+    test_compare_str__(1024, host_ms10000, N, &nums, 3, 148624, 0);
 
     return 0;
 }
