@@ -51,21 +51,27 @@ void host_crt2int(mpz_t n, unsigned K, unsigned *_ms, unsigned *_ns) {
 // =====================================
 // host collatz
 
-int _host_collatz_delay(mpz_t n, unsigned limit, int log=0) {
+int _host_collatz_delay(mpz_t n, unsigned limit) {
     int stops = 0;
     while(limit == 0 || stops < limit && mpz_cmp_ui(n, 1) != 0) {
         if(mpz_even_p(n)) {
-            if(log==1) printf("0 ");
+#if LOG > 0
+            printf("0 ");
+#endif
             mpz_divexact_ui(n, n, 2);
         } else {
-            if(log==1) printf("1 ");
+#if LOG > 0
+            printf("1 ");
+#endif
             mpz_mul_ui(n, n, 3);
             //mpz_mul(n, n, n);
             mpz_add_ui(n, n, 1);
         }
         stops += 1;
     }
-    if(log==1) printf("\n");
+#if LOG > 0
+    printf("\n");
+#endif
 
     if(mpz_cmp_ui(n, 1) == 0)
         return stops;
@@ -83,11 +89,11 @@ unsigned long long current_time_micros() {
     return ((unsigned long long)tv.tv_sec * 1000000ULL) + tv.tv_usec;
 }
 
-int host_collatz_delay(mpz_t _n, unsigned limit, float *time, int log=0) {
+int host_collatz_delay(mpz_t _n, unsigned limit, float *time) {
     mpz_t n; mpz_init(n); mpz_set(n, _n);
 
     unsigned long long begin = current_time_micros();
-    int delay = _host_collatz_delay(n, limit, log);
+    int delay = _host_collatz_delay(n, limit);
     unsigned long long end = current_time_micros();
     unsigned long long time_spent = end - begin;
 
@@ -96,16 +102,16 @@ int host_collatz_delay(mpz_t _n, unsigned limit, float *time, int log=0) {
     return delay;
 }
 
-void host_collatz_steps(mpz_t _n, int repeat, int log=0) {
+void host_collatz_steps(mpz_t _n, int repeat) {
     mpz_t n; mpz_init(n); mpz_set(n, _n);
     gmp_printf("%d C| -> %Zd\n", 0, n);
     for(int i=1; i<=repeat; i++) {
-        _host_collatz_delay(n, 1, log);
+        _host_collatz_delay(n, 1);
         gmp_printf("%d C| -> %Zd\n", i, n);
     }
 }
 
-size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base, int log=0) {
+size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base) {
     mpz_t n; mpz_init(n); mpz_set(n, _n);
     size_t maxbits = mpz_sizeinbase(n, base);
 
@@ -139,11 +145,31 @@ size_t host_collatz_maxbits(mpz_t _n, unsigned limit, int base, int log=0) {
 
 
 #define saturating_div(A,B) (((A) + (B) - 1) / (B))
-#define BLOCK_MULT 2
 
+#if (OPT < 7) && (BLOCK_MULT != 1)
+#error "BLOCK_MULT should be 1 but given " ##BLOCK_MULT
+#endif
 
 __device__ bool __all_block_sync(bool v) {
-    __shared__ int vv[32];
+#if OPT < 1 // Original
+    __shared__ int ret;
+    if(threadIdx.x == 0) ret = 1;
+    __syncthreads();
+    atomicAnd(&ret, v);
+    __syncthreads();
+    return ret;
+
+#elif OPT < 2 // Parallel reduction
+    __shared__ bool vv[1024];
+    vv[threadIdx.x] = v;
+    for(unsigned stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if(threadIdx.x < stride) vv[threadIdx.x] &= vv[threadIdx.x+stride];
+    }
+    return vv[0];
+
+#else // Reduction with warp synchronization
+    __shared__ bool vv[32];
     if(threadIdx.x < 32) {
         vv[threadIdx.x] = 1;
     }
@@ -162,7 +188,51 @@ __device__ bool __all_block_sync(bool v) {
     __syncthreads();
 
     return vv[threadIdx.x / 32];
+#endif
 }
+
+__device__ bool __xor_block_sync(bool v) {
+#if OPT < 1 // Original
+    __shared__ int ret;
+    if(threadIdx.x == 0) ret = 0;
+    __syncthreads();
+    atomicXor(&ret, v);
+    __syncthreads();
+    return ret;
+
+#else // Parallel reduction
+    __shared__ bool vv[1024];
+    vv[threadIdx.x] = v;
+    for(unsigned stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if(threadIdx.x < stride) vv[threadIdx.x] ^= vv[threadIdx.x+stride];
+    }
+    return vv[0];
+#endif
+}
+
+__device__ double __sum_block_sync(double v) {
+#if OPT < 1 // Original
+    __shared__ double ret;
+    if(threadIdx.x == 0) ret = 0;
+    for(int i=0; i<blockDim.x; i++) {
+        __syncthreads();
+        if(i == threadIdx.x) ret += v;
+    }
+    __syncthreads();
+    return ret;
+
+#else // Parallel reduction
+    __shared__ double vv[1024];
+    vv[threadIdx.x] = v;
+    for(unsigned stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if(threadIdx.x < stride) vv[threadIdx.x] += vv[threadIdx.x+stride];
+    }
+    return vv[0];
+#endif
+}
+
 
 __device__ unsigned div2(unsigned m, unsigned n) {
     // assume n < m
@@ -197,14 +267,24 @@ __device__ int mod_inv(int m, int x) {
     }
 }
 
+#if OPT < 6
+__device__ double modf_p(double v, int *p) {
+    double tfrac, tint;
+    tfrac = modf(v, &tint);
+    *p += ((int) tint);
+    return tfrac;
+}
+
+#else
 __device__ double modf_p(double v, bool *p) {
     double tfrac, tint;
     tfrac = modf(v, &tint);
     *p ^= 1 & ((int) tint);
     return tfrac;
 }
+#endif
 
-__global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit, int log=0) {
+__global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigned *ns, unsigned limit) {
     unsigned m[BLOCK_MULT];
     unsigned M_[BLOCK_MULT];
     unsigned n[BLOCK_MULT];
@@ -229,12 +309,32 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
 
     int stops = 0;
 
+#if OPT < 5
+    __shared__ double ranks[1024];
+    __shared__ int rankp[1024];
+    __shared__ int termp[1024];
+
+#elif OPT < 6
+    __shared__ unsigned long long ranks[1024];
+    __shared__ int rankp[1024];
+    __shared__ int termp[1024];
+
+#elif OPT < 7
+    __shared__ unsigned ranks[1024];
+    __shared__ bool rankp[1024];
+
+#elif OPT < 8
+    __shared__ unsigned fracs[1024];
+    __shared__ bool parity[1024];
+
+#else
     __shared__ unsigned rfracs[32];
     __shared__ bool parity[32];
     if (threadIdx.x < 32) {
         rfracs[threadIdx.x] = 0;
         parity[threadIdx.x] = 0;
     }
+#endif
 
     while(limit == 0 || stops < limit) {
 
@@ -243,6 +343,274 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
             is_one &= n[j] == 1;
         is_one = __all_block_sync(is_one);
 
+#if OPT < 3 // Original
+        bool is_even; {
+            double rank = ((double) n[0]) * M_[0] / m[0];
+            double rank_total = __sum_block_sync(rank) + 1e-3;
+            bool rank_parity = 1 & (int) floor(rank_total);
+
+            bool term_parity = (((unsigned long) n[0]) * M_[0]) % 2;
+            bool terms_parity = __xor_block_sync(term_parity);
+
+            bool parity = rank_parity ^ terms_parity;
+            is_even = !parity;
+        }
+
+#elif OPT < 4 // Rank float destruct; (80089a) N <= ?
+        bool is_even; {
+            double rank = ((double) n[0]) * (((double) M_[0]) / m[0]);
+            double tint, tfrac;
+            tfrac = modf(rank, &tint);
+            rank = (((int) tint) % 2) + tfrac;
+            double rank_total = __sum_block_sync(rank) + 1e-3;
+            bool rank_parity = 1 & (int) floor(rank_total);
+
+            bool term_parity = (((unsigned long) n[0]) * M_[0]) % 2;
+            bool terms_parity = __xor_block_sync(term_parity);
+
+            bool parity = rank_parity ^ terms_parity;
+            is_even = !parity;
+        }
+
+#elif OPT < 5 // Aggressive rank float dustruct; (695f0f5) N <= 512
+        bool is_even; {
+            double rank = ((double) M_[0]) / (double) m[0];
+            int pp = 0;
+            rank = modf_p(rank, &pp);
+            rank = modf_p(((double) n[0]) * rank, &pp);
+
+            ranks[threadIdx.x] = rank;
+            rankp[threadIdx.x] = pp;
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                if (threadIdx.x < stride) {
+                    double r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
+                    int p = rankp[threadIdx.x] + rankp[threadIdx.x + stride];
+                    r = modf_p(r, &p);
+                    ranks[threadIdx.x] = r;
+                    rankp[threadIdx.x] = p;
+                }
+                __syncthreads();
+            }
+            if(threadIdx.x == 0) ranks[0] = modf_p(ranks[0] + 1e-3, &rankp[0]);
+            __syncthreads();
+            int rank_parity = rankp[0];
+
+            int term_parity = (((unsigned long) n[0]) * M_[0]) % 2;
+            termp[threadIdx.x] = term_parity;
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                if (threadIdx.x < stride) {
+                    termp[threadIdx.x] += termp[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            bool terms_parity = 1 & termp[0];
+
+            bool parity = 1 & (rank_parity ^ terms_parity);
+            is_even = !parity;
+        }
+
+#elif OPT < 6 // Fixed point rank; (392af8) <= 1024
+        bool is_even; {
+            double rank = ((double) M_[0]) / (double) m[0];
+            int pp = 0;
+            rank = modf_p(rank, &pp);
+            rank = modf_p(((double) n[0]) * rank, &pp);
+
+            unsigned long long rank_fracs = rank * (1ULL<<63);
+
+            ranks[threadIdx.x] = rank_fracs;
+            rankp[threadIdx.x] = pp;
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                __syncthreads();
+                if (threadIdx.x < stride) {
+                    unsigned long long r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
+                    int p = rankp[threadIdx.x] + rankp[threadIdx.x + stride];
+                    ranks[threadIdx.x] = r & 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
+                    rankp[threadIdx.x] = p + (1 & (r >> 63));
+                }
+                __syncthreads();
+            }
+            if(threadIdx.x == 0) {
+                ranks[0] += 0x0010000000000000ULL;
+                rankp[0] += 1 & (ranks[0] >> 63);
+                ranks[0] &= 0x7FFFFFFFFFFFFFFFULL; // r & ((1ULL<<63)-1);
+            }
+            __syncthreads();
+            //double rank_total = ((double) ranks[0]) / ((double) (1ULL<<63));
+            int rank_parity = rankp[0];
+
+            __syncthreads();
+
+            int term_parity = (((unsigned long) n[0]) * M_[0]) % 2;
+            termp[threadIdx.x] = term_parity;
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                if (threadIdx.x < stride) {
+                    termp[threadIdx.x] += termp[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            bool terms_parity = 1 & termp[0];
+
+            bool parity = 1 & (rank_parity ^ terms_parity);
+            is_even = !parity;
+        }
+
+#elif OPT < 7 // Single reduction parity calculation; (880742a894f) N <= 1024
+        bool is_even; {
+            double rank = ((double) M_[0]) / (double) m[0];
+            bool pp = 0;
+            rank = modf_p(rank, &pp);
+            rank = modf_p(((double) n[0]) * rank, &pp);
+            unsigned rank_fracs = rank * (1U<<31);
+            bool term_parity = (1 & n[0]) * (1 & M_[0]);
+
+            ranks[threadIdx.x] = rank_fracs;
+            rankp[threadIdx.x] = pp ^ term_parity;
+
+            for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) { // TODO unroll last warp
+                __syncthreads();
+                if (threadIdx.x < stride) {
+                    unsigned r = ranks[threadIdx.x] + ranks[threadIdx.x + stride];
+                    bool p = rankp[threadIdx.x] ^ rankp[threadIdx.x + stride];
+                    ranks[threadIdx.x] = r & 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
+                    rankp[threadIdx.x] = p ^ (1 & (r >> 31));
+                }
+            }
+            if(threadIdx.x == 0) {
+                ranks[0] += 0x00100000U;
+                rankp[0] ^= 1 & (ranks[0] >> 31);
+                ranks[0] &= 0x7FFFFFFFU; // r & ((1ULL<<63)-1);
+            }
+            __syncthreads();
+
+            bool parity = rankp[0];
+            is_even = !parity;
+        }
+
+#elif OPT < 8 // Rank reduction with loop unroll; (824e934930) N <= 1024
+        bool is_even; {
+            double rank = ((double) M_[0]) / (double) m[0];
+            bool pp = 0;
+            rank = modf_p(rank, &pp);
+            rank = modf_p(((double) n[0]) * rank, &pp);
+            unsigned rank_fracs = rank * (1U<<31);
+            bool term_parity = (1 & n[0]) * (1 & M_[0]);
+
+            fracs[threadIdx.x] = rank_fracs;
+            parity[threadIdx.x] = pp ^ term_parity;
+
+            for (unsigned stride = blockDim.x / 2; stride > 32; stride >>= 1) { // TODO unroll last warp
+                __syncthreads();
+                if (threadIdx.x < stride) {
+                    unsigned f = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
+                    bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
+                    fracs[threadIdx.x] = f & 0x7FFFFFFFU; // f & ((1ULL<<63)-1);
+                    parity[threadIdx.x] = p ^ (f >> 31);
+                }
+            }
+            if (threadIdx.x < 32) {
+
+                unsigned stride = 32;
+                unsigned f = fracs[threadIdx.x] + fracs[threadIdx.x + stride];
+                bool p = parity[threadIdx.x] ^ parity[threadIdx.x + stride];
+                p ^= (f >> 31);
+                f &= 0x7FFFFFFFU;
+
+                stride = 16; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                stride = 8; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                stride = 4; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+                stride = 2; {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                stride = 1; {
+                    f += __shfl_down_sync(0xFFFFFFF, f, 1, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFF, p, 1, 32);
+                    f += 0x00100000U;
+                    p ^= (f >> 31);
+                }
+
+                if(threadIdx.x == 0) parity[0] = p;
+            }
+
+            __syncthreads();
+
+            is_even = !parity[0];
+        }
+
+#elif OPT < 9 // Rank reduction using warp synchronization with loop unroll; (f4d9bc9137) N <= 1024
+        bool is_even; {
+            double rank = ((double) M_[0]) / (double) m[0];
+            bool pp = 0;
+            rank = modf_p(rank, &pp);
+            rank = modf_p(((double) n[0]) * rank, &pp);
+            unsigned rank_rfracs = rank * (1U<<31);
+            bool term_parity = (1 & n[0]) * (1 & M_[0]);
+
+            unsigned f = rank_rfracs;
+            bool p = pp ^ term_parity;
+
+            for(unsigned stride = 32/2; stride > 0; stride >>= 1) {
+                f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                p ^= (f >> 31);
+                f &= 0x7FFFFFFFU;
+            }
+
+            if(threadIdx.x % 32 == 0) {
+                rfracs[threadIdx.x / 32] = f;
+                parity[threadIdx.x / 32] = p;
+            }
+
+            __syncthreads();
+
+            if (threadIdx.x < 32) {
+                f = rfracs[threadIdx.x];
+                p = parity[threadIdx.x];
+
+                for(unsigned stride = 32/2; stride > 1; stride >>= 1) {
+                    f += __shfl_down_sync(0xFFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFFF, p, stride, 32);
+                    p ^= (f >> 31);
+                    f &= 0x7FFFFFFFU;
+                }
+
+                unsigned stride = 1; {
+                    f += __shfl_down_sync(0xFFFFFFF, f, stride, 32);
+                    p ^= __shfl_down_sync(0xFFFFFFF, p, stride, 32);
+                    f += 0x00100000U;
+                    p ^= (f >> 31);
+                }
+
+                if(threadIdx.x == 0) parity[0] = p;
+            }
+
+            __syncthreads();
+
+            is_even = !parity[0];
+        }
+
+#elif OPT < 10 // Multi value for thread on register; (1e44b32710) N <= 2048
         bool is_even; {
 
             unsigned f = 0;
@@ -315,16 +683,22 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
 
             is_even = !parity[0];
         }
+//#elif OPT < 11 // Multi value for thread on shared memory; (1e44b32710) N <= 2048
+#endif
 
         if (is_one) break;
 
         if(is_even) {
-            if(log==1) if(threadIdx.x==0) printf("0 ");
+#if LOG > 0
+            if(threadIdx.x==0) printf("0 ");
+#endif
             for(int j=0; j<BLOCK_MULT; j++) {
                 n[j] = div2(m[j], n[j]); n[j] %= m[j];
             }
         } else {
-            if(log==1) if(threadIdx.x==0) printf("1 ");
+#if LOG > 0
+            if(threadIdx.x==0) printf("1 ");
+#endif
             // FIXME assume m < UINTMAX/3
             for(int j=0; j<BLOCK_MULT; j++) {
                 n[j] *= 3; n[j] += 1; n[j] %= m[j];
@@ -339,7 +713,9 @@ __global__ void collatz_delay_kernel(int *ret, unsigned K, unsigned *ms, unsigne
         ns[blockIdx.x * K + k] = n[j];
     }
 
-    if(log==1) if(threadIdx.x==0) printf("\n");
+#if LOG > 0
+    if(threadIdx.x==0) printf("\n");
+#endif
 
     if(threadIdx.x == 0)
         if(limit == 0 || stops < limit) 
@@ -381,7 +757,7 @@ void device_collatz_free(struct collatz_delay_t *A) {
     cudaEventDestroy(A->stop);
 }
 
-void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit, float *time, int log=0) {
+void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit, float *time) {
     assert(A->K % BLOCK_MULT == 0); // FIXME
     int blockDim = saturating_div(A->K, BLOCK_MULT);
     int gridDim = A->T;
@@ -390,10 +766,11 @@ void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit
     CUDACHECK( cudaMalloc((void **)&device_delay, A->T * sizeof(int)) );
 
     CUDACHECK( cudaEventRecord(A->start, 0) );
-    if(log) printf("collatz_delay_kernel<<<%d,%d>>>(ret, K=%d, ms, ns, limit=%d);\n", gridDim,blockDim,A->K,limit);
+#if LOG > 0
+    printf("collatz_delay_kernel<<<%d,%d>>>(ret, K=%d, ms, ns, limit=%d);\n", gridDim,blockDim,A->K,limit);
+#endif
     cudaError_t err = cudaGetLastError();
-    printf("CUDAERR: %s\n", cudaGetErrorString(err));
-    collatz_delay_kernel<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit, log);
+    collatz_delay_kernel<<<gridDim,blockDim>>>(device_delay, A->K, A->device_ms, A->device_ns, limit);
     CUDACHECK( cudaEventRecord(A->stop, 0) );
 
     CUDACHECK( cudaMemcpy(delay, device_delay, A->T * sizeof(int), cudaMemcpyDeviceToHost) );
@@ -406,21 +783,21 @@ void device_collatz_kernel(int *delay, struct collatz_delay_t *A, unsigned limit
     if(time != NULL) *time += ms;
 }
 
-void device_collatz_delay(int *delay, unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, unsigned limit, float *time, int log=0) {
+void device_collatz_delay(int *delay, unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, unsigned limit, float *time) {
     struct collatz_delay_t A;
     device_collatz_init(&A, K, host_ms, T, n);
-    device_collatz_kernel(delay, &A, limit, time, log);
+    device_collatz_kernel(delay, &A, limit, time);
     device_collatz_free(&A);
 }
 
 // T = 1 assumed. but for some reason, I have to get 'n' as a pointer
-void device_collatz_steps(unsigned K, unsigned *host_ms, mpz_t *n, int repeat, int log=0) {
+void device_collatz_steps(unsigned K, unsigned *host_ms, mpz_t *n, int repeat) {
     gmp_printf("%d G| -> %Zd\n", 0, *n);
     struct collatz_delay_t A;
     device_collatz_init(&A, K, host_ms, 1, n);
     int ret;
     for(int i=1; i<=repeat; i++) {
-        device_collatz_kernel(&ret, &A, 1, NULL, log);
+        device_collatz_kernel(&ret, &A, 1, NULL);
         mpz_t x; mpz_init(x);
         host_crt2int(x, K, host_ms, A.host_ns);
         gmp_printf("%d G| -> %Zd\n", i, x);
@@ -428,47 +805,47 @@ void device_collatz_steps(unsigned K, unsigned *host_ms, mpz_t *n, int repeat, i
     device_collatz_free(&A);
 }
 
-void test_compare_str(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int sel, unsigned limit, int log) {
+void test_compare_str(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int sel, unsigned limit) {
     int *delay_host = (int*) malloc(T * sizeof(int));
     memset(delay_host, 0, T * sizeof(int));
     float time_spent_cpu = 0;
-    if(sel & 1) for(int t=0; t<T; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu, log);
+    if(sel & 1) for(int t=0; t<T; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu);
     gmp_printf("cpu time: \t%f ms\t\n", time_spent_cpu);
 
     int *delay_device = (int*) malloc(T * sizeof(int));
     memset(delay_device, 0, T * sizeof(int));
     float time_spent_gpu = 0;
-    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, T, n, limit, &time_spent_gpu, log);
+    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, T, n, limit, &time_spent_gpu);
     gmp_printf("gpu time: \t%f ms\n", time_spent_gpu);
 
     for(int t=0; t<T; t++) // if(delay_host!=delay_device)
         gmp_printf(": %3d %c %3d\n", delay_host[t], (delay_host[t]==delay_device[t])?' ':'|', delay_device[t]);
 }
 
-void test_compare_str_(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int sel, unsigned limit, int log) {
+void test_compare_str_(unsigned K, unsigned *host_ms, unsigned T, mpz_t *n, int sel, unsigned limit) {
     int *delay_host = (int*) malloc(T * sizeof(int));
     memset(delay_host, 0, T * sizeof(int));
     float time_spent_cpu = 0;
-    if(sel & 1) for(int t=0; t<T; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu, log);
+    if(sel & 1) for(int t=0; t<T; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu);
 
     int *delay_device = (int*) malloc(T * sizeof(int));
     memset(delay_device, 0, T * sizeof(int));
     float time_spent_gpu = 0;
-    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, T, n, limit, &time_spent_gpu, log);
+    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, T, n, limit, &time_spent_gpu);
 
     gmp_printf("%d\t%f\t%f\n", T, time_spent_cpu, time_spent_gpu);
 }
 
-void test_compare_str__(unsigned K, unsigned *host_ms, unsigned N, mpz_t *n, int sel, unsigned limit, int log) {
+void test_compare_str__(unsigned K, unsigned *host_ms, unsigned N, mpz_t *n, int sel, unsigned limit) {
     int *delay_host = (int*) malloc(1 * sizeof(int));
     memset(delay_host, 0, 1 * sizeof(int));
     float time_spent_cpu = 0;
-    if(sel & 1) for(int t=0; t<1; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu, log);
+    if(sel & 1) for(int t=0; t<1; t++) delay_host[t] = host_collatz_delay(n[t], limit, &time_spent_cpu);
 
     int *delay_device = (int*) malloc(1 * sizeof(int));
     memset(delay_device, 0, 1 * sizeof(int));
     float time_spent_gpu = 0;
-    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, 1, n, limit, &time_spent_gpu, log);
+    if(sel & 2) device_collatz_delay(delay_device, K, host_ms, 1, n, limit, &time_spent_gpu);
 
     gmp_printf("%d\t%d\t%d\t%f\t%f\n", N, delay_host[0], delay_device[0], time_spent_cpu, time_spent_gpu);
 }
@@ -549,7 +926,7 @@ int main(int argc, char **argv) {
 
     mpz_t n; mpz_init(n); mpz_set_str(n, num, 10);
     if(sel <= 3) 
-        test_compare_str(K, host_ms, 1, &n, sel, limit, 1);
+        test_compare_str__(K, host_ms, 1, &n, sel, limit);
     else if(sel == 4) {
         host_collatz_steps(n, 10);
         device_collatz_steps(K, host_ms, &n, 10);
@@ -562,7 +939,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-int __main(int argc, char **argv) {
+int _main(int argc, char **argv) {
 
     char *num = 
         #include "num"
@@ -576,37 +953,29 @@ int __main(int argc, char **argv) {
         mpz_set_str(nums[t], num, 10);
     }
 
-    test_compare_str_(1024, host_ms10000, T, nums, 3, 148624, 0);
+    //test_compare_str_(1024, host_ms10000, T, nums, 3, 148624);
+    test_compare_str_(2048, host_ms10000, T, nums, 2, 300982);
 
     return 0;
 }
 
-char num[7000];
-int _main(int argc, char **argv) {
+char num[13000];
+int __main(int argc, char **argv) {
 
     char *_num =
         #include "num"
     ;
 
     int N = 1 << atoi(argv[1]);
+    //int N = 12800;
     strncpy(num, _num, N);
 
     mpz_t nums;
     mpz_init(nums);
     mpz_set_str(nums, num, 10);
 
-    test_compare_str__(1024, host_ms10000, N, &nums, 3, 148624, 0);
+    //test_compare_str__(1024, host_ms10000, N, &nums, 3, 148624);
+    test_compare_str__(2048, host_ms10000, N, &nums, 3, 300982);
 
     return 0;
 }
-
-// TODO baseline? https://github.com/kisupov/grns/blob/master/src/mpint.cuh 
-// TODO REF:https://pdf.sciencedirectassets.com/271503/1-s2.0-S0898122105X08604/1-s2.0-S0898122105002890/main.pdf?X-Amz-Security-Token=IQoJb3JpZ2luX2VjEAEaCXVzLWVhc3QtMSJGMEQCIGo1xFIcj66pOtfY6J%2FYcPJvyOn%2BkUzr20%2FacIZlg4SmAiB9MkoM3AMGjPu8HAzaIimJ20J%2FAip0xTxYnAsd7hejyiqyBQhqEAUaDDA1OTAwMzU0Njg2NSIMQWrqhooi4lWCxZ4TKo8FZRHzLS5gGO4ZpPqix9%2BkifkwMuj%2FK4tZpNBetzdoAzrH0GmHHjz50jhkzhp4WdWiETH%2FLQVn10XIW%2F65r2P5Nc7pyBulLDTjgyZNEkfZRlAYm5JMPBcx%2BLu%2BJ8yIvCgWxTfN65XjvlajCWw8UoeqCSn7wm0rktUYdDaAPNaM4%2Bin0AwTic2Mnm9G%2BRnFarmCcebJKnepFN8D0kywMm62%2BjvCXSR9p0zdrtCrJC2fk3VJUKCJE2ZNvcOKIXD%2FsVYg4h2bcBAx0t3EOwQOiH0ZrMavh2XMyXEH2AfzrK2jKBgiWE3mkBOF7OcgxbT8mN18LywQXf4GKdCbZesQxp3NlUFIQx9pNUU6wfgHaSKSzlq%2BkwMqLGGnA2Q8IoLwMkPc5XjcuBB0aTXOkOkwHLQxE1TWRqaJbLdUuJG6jqLmtMhQJUyKEwS%2FlA%2BRlRrcdNtrPMYsOP0YPLmwLVwNU619XFrjvF%2Ffp5N4iq%2BUb6PHwEKu2IImlWPrQTvIGAlAFRcdnh5SsNo%2B18TA20tSaoIfrun%2F9G%2B2SCcxPrnuxHmdqwnJEg37q2lfQ2MmW4DdowlGCcnVP6oscRfpaj3fU%2BvLozc9xwv6Q1vqPCHaLvNepqiGJLyjFvIqwo7Zsp98mFV2AfMjFSsEaWkpquX3uuAovFvb3B3eS2TurQAyJetQLA5vT7GwdFEv7EjJCWvOGS9wJ6WfHqfF1aRG21WqnLXvm%2BLEZMr5jKMGqTxCeUHhs7RLlbpBdTPkFaSkycmurFNUIFpfvM%2Bxlf8aOM9GceWTupP8YYcqBeXWC6vaiynmw1oGDo2DIeXjzNMMnuiCVgcU2BiRRa9N5kYVwRPD4%2FuUh%2FGqCiZ2AlqKXNv90ukPKDCN3bmrBjqyAbcy6POXsO4CMMY2UmTuMaxRiSCkCfdepdi3Ktu9Gd%2F%2Ff2pQ3TJoe6yN3blB1YMS0ZwO1svNnAgfk8z7mAN7%2BiCMp5aBGBxH4LN8A0anwhLA%2FJcxlLWoMTno9HLiDqA2YaUfjQa4NdE5JL96oDV5MierdaKecKZ0zmXGOW3s7nXEmJvF4Xqlvl8c92IheBpt7Gkt4Ul4Y%2FXgyIG8solI%2F0r64QSdvqyAD1ejXgf1D57jhu8%3D&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20231205T014736Z&X-Amz-SignedHeaders=host&X-Amz-Expires=300&X-Amz-Credential=ASIAQ3PHCVTY4AIUGWIT%2F20231205%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=d8c84771daf4ce33785a1c6cba18745d84674cfeb3534c584412ab0c389a1c91&hash=bd0fd1bf729c1c1e273ccae0dcf1ca93cb83157d1e40f578516367132744b5fe&host=68042c943591013ac2b2430a89b270f6af2c76d8dfd086a07176afe7c76c2c61&pii=S0898122105002890&tid=spdf-0c438e76-d7a8-4f07-a20b-1993fbeba9bc&sid=fea44b6a49440649f418d659643dc372823fgxrqa&type=client&tsoh=d3d3LnNjaWVuY2VkaXJlY3QuY29t&ua=0d125e5251595b025202&rr=83089f3db8ceedb5&cc=kr 
-// TODO REF:https://www.sciencedirect.com/science/article/pii/S0898122105002890?via%3Dihub
-// TODO REF: https://link.springer.com/article/10.1007/s00224-021-10035-y#Bib1 
-// TODO REF:https://sci-hub.se/https://doi.org/10.1007/s11432-008-0097-y
-// TODO REF:https://link.springer.com/chapter/10.1007/978-3-031-34127-4_4#editor-information
-/*
-https://www.tandfonline.com/doi/full/10.1080/00207160410001708805?scroll=top&needAccess=true
-https://ieeexplore.ieee.org/document/1509927
-*/
