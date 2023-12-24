@@ -17,6 +17,7 @@ then you can run the example by
 ./run_for_opt_levels.sh $n $k
 ```
 where $n is the initial value, and $k is the number of threads.
+it outputs input size, Collatz delay calculated by CPU, Collatz delay calculated by GPU, CPU time, GPU time.
 
 you can change optimization level, # of numbers per thread via compilation macro OPT and MULT.
 change it as you like in the shell script.
